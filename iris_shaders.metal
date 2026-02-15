@@ -2134,3 +2134,284 @@ kernel void upsample_nearest_2x_f32(
 
     out[c * out_spatial + oy * out_w + ox] = x[c * in_h * in_w + iy * in_w + ix];
 }
+
+/* ========================================================================
+ * Fused QK RMSNorm + RoPE (Flux: 4-axis split-half)
+ *
+ * Combines qk_rms_norm + apply_rope_2d into a single kernel.
+ * Each thread handles one (seq_idx, head_idx) pair for both Q and K.
+ * q, k: [seq, heads*head_dim] (f32, modified in-place)
+ * q_weight, k_weight: [head_dim]
+ * cos, sin: [seq, head_dim]
+ * ======================================================================== */
+kernel void qk_norm_rope_2d(
+    device float *q [[buffer(0)]],
+    device float *k [[buffer(1)]],
+    device const float *q_weight [[buffer(2)]],
+    device const float *k_weight [[buffer(3)]],
+    device const float *cos_freq [[buffer(4)]],
+    device const float *sin_freq [[buffer(5)]],
+    constant int &heads [[buffer(6)]],
+    constant int &head_dim [[buffer(7)]],
+    constant float &eps [[buffer(8)]],
+    constant int &axis_dim [[buffer(9)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint seq_idx = pos.x;
+    uint head_idx = pos.y;
+    if (head_idx >= uint(heads)) return;
+
+    uint hidden = heads * head_dim;
+    uint offset = seq_idx * hidden + head_idx * head_dim;
+    device const float *cos_row = cos_freq + seq_idx * head_dim;
+    device const float *sin_row = sin_freq + seq_idx * head_dim;
+    int half_axis = axis_dim / 2;
+
+    // Q: RMSNorm then RoPE
+    float sum_sq = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = q[offset + d];
+        sum_sq += val * val;
+    }
+    float rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
+    for (int d = 0; d < head_dim; d++) {
+        q[offset + d] = q[offset + d] * rms_inv * q_weight[d];
+    }
+    // RoPE 4-axis split-half
+    for (int axis = 0; axis < 4; axis++) {
+        int ao = axis * axis_dim;
+        for (int d = 0; d < half_axis; d++) {
+            int i0 = ao + d;
+            int i1 = ao + half_axis + d;
+            float c = cos_row[i0];
+            float s = sin_row[i0];
+            float x0 = q[offset + i0];
+            float x1 = q[offset + i1];
+            q[offset + i0] = x0 * c - x1 * s;
+            q[offset + i1] = x0 * s + x1 * c;
+        }
+    }
+
+    // K: RMSNorm then RoPE
+    sum_sq = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = k[offset + d];
+        sum_sq += val * val;
+    }
+    rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
+    for (int d = 0; d < head_dim; d++) {
+        k[offset + d] = k[offset + d] * rms_inv * k_weight[d];
+    }
+    for (int axis = 0; axis < 4; axis++) {
+        int ao = axis * axis_dim;
+        for (int d = 0; d < half_axis; d++) {
+            int i0 = ao + d;
+            int i1 = ao + half_axis + d;
+            float c = cos_row[i0];
+            float s = sin_row[i0];
+            float x0 = k[offset + i0];
+            float x1 = k[offset + i1];
+            k[offset + i0] = x0 * c - x1 * s;
+            k[offset + i1] = x0 * s + x1 * c;
+        }
+    }
+}
+
+/* ========================================================================
+ * Fused QK RMSNorm + RoPE (Flux: unified text/image, consecutive pairs)
+ *
+ * Combines qk_rms_norm + apply_rope_unified into a single kernel.
+ * Handles text tokens (seq < img_offset) with text frequencies and
+ * image tokens (seq >= img_offset) with image frequencies.
+ * q, k: [seq, heads*head_dim] (f32, modified in-place)
+ * ======================================================================== */
+kernel void qk_norm_rope_unified(
+    device float *q [[buffer(0)]],
+    device float *k [[buffer(1)]],
+    device const float *q_weight [[buffer(2)]],
+    device const float *k_weight [[buffer(3)]],
+    device const float *txt_cos [[buffer(4)]],
+    device const float *txt_sin [[buffer(5)]],
+    device const float *img_cos [[buffer(6)]],
+    device const float *img_sin [[buffer(7)]],
+    constant int &seq [[buffer(8)]],
+    constant int &img_offset [[buffer(9)]],
+    constant int &heads [[buffer(10)]],
+    constant int &head_dim [[buffer(11)]],
+    constant float &eps [[buffer(12)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint seq_idx = pos.x;
+    uint head_idx = pos.y;
+    if (seq_idx >= uint(seq) || head_idx >= uint(heads)) return;
+
+    uint hidden = heads * head_dim;
+    uint offset = seq_idx * hidden + head_idx * head_dim;
+
+    device const float *cos_row;
+    device const float *sin_row;
+    if (seq_idx < uint(img_offset)) {
+        cos_row = txt_cos + seq_idx * head_dim;
+        sin_row = txt_sin + seq_idx * head_dim;
+    } else {
+        uint img_idx = seq_idx - uint(img_offset);
+        cos_row = img_cos + img_idx * head_dim;
+        sin_row = img_sin + img_idx * head_dim;
+    }
+
+    // Q: RMSNorm then RoPE (consecutive pairs)
+    float sum_sq = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = q[offset + d];
+        sum_sq += val * val;
+    }
+    float rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
+    for (int d = 0; d < head_dim; d++) {
+        q[offset + d] = q[offset + d] * rms_inv * q_weight[d];
+    }
+    for (int d = 0; d < head_dim; d += 2) {
+        float c = cos_row[d];
+        float s = sin_row[d];
+        float x0 = q[offset + d];
+        float x1 = q[offset + d + 1];
+        q[offset + d] = x0 * c - x1 * s;
+        q[offset + d + 1] = x1 * c + x0 * s;
+    }
+
+    // K: RMSNorm then RoPE (consecutive pairs)
+    sum_sq = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = k[offset + d];
+        sum_sq += val * val;
+    }
+    rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
+    for (int d = 0; d < head_dim; d++) {
+        k[offset + d] = k[offset + d] * rms_inv * k_weight[d];
+    }
+    for (int d = 0; d < head_dim; d += 2) {
+        float c = cos_row[d];
+        float s = sin_row[d];
+        float x0 = k[offset + d];
+        float x1 = k[offset + d + 1];
+        k[offset + d] = x0 * c - x1 * s;
+        k[offset + d + 1] = x1 * c + x0 * s;
+    }
+}
+
+/* ========================================================================
+ * Fused QK RMSNorm + RoPE (Z-Image: 3-axis consecutive pairs, single table)
+ *
+ * Combines qk_rms_norm + rope for Z-Image where all tokens share the
+ * same cos/sin table. Consecutive pair rotation: (d, d+1).
+ * q, k: [seq, heads*head_dim] (f32, modified in-place)
+ * ======================================================================== */
+kernel void qk_norm_rope_single(
+    device float *q [[buffer(0)]],
+    device float *k [[buffer(1)]],
+    device const float *q_weight [[buffer(2)]],
+    device const float *k_weight [[buffer(3)]],
+    device const float *cos_freq [[buffer(4)]],
+    device const float *sin_freq [[buffer(5)]],
+    constant int &heads [[buffer(6)]],
+    constant int &head_dim [[buffer(7)]],
+    constant float &eps [[buffer(8)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint seq_idx = pos.x;
+    uint head_idx = pos.y;
+    if (head_idx >= uint(heads)) return;
+
+    uint hidden = heads * head_dim;
+    uint offset = seq_idx * hidden + head_idx * head_dim;
+    device const float *cos_row = cos_freq + seq_idx * head_dim;
+    device const float *sin_row = sin_freq + seq_idx * head_dim;
+
+    // Q: RMSNorm then RoPE
+    float sum_sq = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = q[offset + d];
+        sum_sq += val * val;
+    }
+    float rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
+    for (int d = 0; d < head_dim; d++) {
+        q[offset + d] = q[offset + d] * rms_inv * q_weight[d];
+    }
+    for (int d = 0; d < head_dim; d += 2) {
+        float c = cos_row[d];
+        float s = sin_row[d];
+        float x0 = q[offset + d];
+        float x1 = q[offset + d + 1];
+        q[offset + d] = x0 * c - x1 * s;
+        q[offset + d + 1] = x1 * c + x0 * s;
+    }
+
+    // K: RMSNorm then RoPE
+    sum_sq = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = k[offset + d];
+        sum_sq += val * val;
+    }
+    rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
+    for (int d = 0; d < head_dim; d++) {
+        k[offset + d] = k[offset + d] * rms_inv * k_weight[d];
+    }
+    for (int d = 0; d < head_dim; d += 2) {
+        float c = cos_row[d];
+        float s = sin_row[d];
+        float x0 = k[offset + d];
+        float x1 = k[offset + d + 1];
+        k[offset + d] = x0 * c - x1 * s;
+        k[offset + d + 1] = x1 * c + x0 * s;
+    }
+}
+
+/* ========================================================================
+ * Fused RMSNorm + Gated Add (Z-Image)
+ *
+ * Combines: norm = rms_norm(proj, weight), then out += gate * norm
+ * into a single kernel, eliminating the intermediate norm buffer.
+ * proj: [seq, hidden] (input, read-only)
+ * weight: [hidden] (norm weight)
+ * gate: [hidden] (broadcast across seq)
+ * out: [seq, hidden] (accumulated in-place)
+ * ======================================================================== */
+kernel void rms_norm_gated_add(
+    device float *out [[buffer(0)]],
+    device const float *proj [[buffer(1)]],
+    device const float *weight [[buffer(2)]],
+    device const float *gate [[buffer(3)]],
+    constant int &hidden [[buffer(4)]],
+    constant float &eps [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+
+    device const float *proj_row = proj + row * hidden;
+    device float *out_row = out + row * hidden;
+
+    // Compute partial sum of squares for RMSNorm
+    float local_sum = 0.0f;
+    for (int i = tid; i < hidden; i += threads) {
+        float val = proj_row[i];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms_inv = rsqrt(shared_sum[0] / float(hidden) + eps);
+
+    // Apply: out += gate * (proj * rms_inv * weight)
+    for (int i = tid; i < hidden; i += threads) {
+        out_row[i] += gate[i] * (proj_row[i] * rms_inv * weight[i]);
+    }
+}

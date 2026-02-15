@@ -2360,7 +2360,6 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     int head_dim = tf->head_dim;
     int mlp_hidden = tf->mlp_hidden;
     float eps = 1e-6f;
-    int axis_dim = 32;
 
     /* === Phase 1: AdaLN modulation (small, keep on CPU) === */
     int mod_size = h_size * 3;
@@ -2446,15 +2445,12 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     iris_gpu_split_qkv_mlp(fused_result, q_gpu, k_gpu, v_gpu, gate_gpu, up_gpu,
                            seq, h_size, mlp_hidden);
 
-    /* === Phase 6: QK RMSNorm on GPU === */
-    iris_gpu_qk_rms_norm(q_gpu, k_gpu, block->norm_q_weight, block->norm_k_weight,
-                         seq, heads, head_dim, eps);
-
-    /* === Phase 7: Apply unified RoPE on GPU (handles text+image in one call) === */
-    iris_gpu_rope_unified(q_gpu, k_gpu,
-                          txt_rope_cos, txt_rope_sin,
-                          img_rope_cos, img_rope_sin,
-                          seq, img_offset, heads, head_dim, axis_dim);
+    /* === Phase 6+7: Fused QK RMSNorm + unified RoPE on GPU === */
+    iris_gpu_qk_norm_rope_unified(q_gpu, k_gpu,
+                                   block->norm_q_weight, block->norm_k_weight,
+                                   txt_rope_cos, txt_rope_sin,
+                                   img_rope_cos, img_rope_sin,
+                                   seq, img_offset, heads, head_dim, eps);
 
     /* === Phase 8: Self-attention on GPU === */
     /* Try fused attention (seq <= 1024), then bf16 MPS attention (any seq) */
@@ -2610,7 +2606,6 @@ static int single_block_forward_gpu_chained(iris_gpu_tensor_t hidden_gpu,
     int mlp_hidden = tf->mlp_hidden;
     int fused_dim = h_size * 3 + mlp_hidden * 2;  /* QKV + gate + up */
     float eps = 1e-6f;
-    int axis_dim = 32;
 
     int own_tensors = (scratch == NULL);
 
@@ -2696,15 +2691,12 @@ static int single_block_forward_gpu_chained(iris_gpu_tensor_t hidden_gpu,
     iris_gpu_split_qkv_mlp(fused_result, q_gpu, k_gpu, v_gpu, gate_gpu, up_gpu,
                            seq, h_size, mlp_hidden);
 
-    /* === Phase 6: QK RMSNorm on GPU === */
-    iris_gpu_qk_rms_norm(q_gpu, k_gpu, block->norm_q_weight, block->norm_k_weight,
-                         seq, heads, head_dim, eps);
-
-    /* === Phase 7: Apply unified RoPE on GPU (handles text+image in one call) === */
-    iris_gpu_rope_unified(q_gpu, k_gpu,
-                          txt_rope_cos, txt_rope_sin,
-                          img_rope_cos, img_rope_sin,
-                          seq, img_offset, heads, head_dim, axis_dim);
+    /* === Phase 6+7: Fused QK RMSNorm + unified RoPE on GPU === */
+    iris_gpu_qk_norm_rope_unified(q_gpu, k_gpu,
+                                   block->norm_q_weight, block->norm_k_weight,
+                                   txt_rope_cos, txt_rope_sin,
+                                   img_rope_cos, img_rope_sin,
+                                   seq, img_offset, heads, head_dim, eps);
 
     /* === Phase 8: Self-attention on GPU === */
     float attn_scale = 1.0f / sqrtf((float)head_dim);

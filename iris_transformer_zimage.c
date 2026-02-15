@@ -1011,15 +1011,11 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                         seq, dim, dim)) return 0;
         }
 
-        /* GPU: QK normalization */
-        iris_gpu_qk_rms_norm(scratch->q, scratch->k,
-                              block->attn_norm_q, block->attn_norm_k,
-                              seq, n_heads, head_dim, ZI_NORM_EPS);
-
-        /* GPU: RoPE (full head_dim, pre-assembled 3-axis table) */
-        iris_gpu_rope_single_pair_f32(scratch->q, scratch->k,
+        /* GPU: Fused QK normalization + RoPE */
+        iris_gpu_qk_norm_rope_single(scratch->q, scratch->k,
+                                      block->attn_norm_q, block->attn_norm_k,
                                       rope_cos, rope_sin,
-                                      seq, n_heads, head_dim);
+                                      seq, n_heads, head_dim, ZI_NORM_EPS);
 
         /* GPU: Self-attention */
         float attn_scale = 1.0f / sqrtf((float)head_dim);
@@ -1033,10 +1029,10 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                     block->attn_out_weight_bf16, block->attn_out_weight,
                                     seq, dim, dim)) return 0;
 
-        /* GPU: attn_norm2 + gated residual: x += gate_msa * norm2(proj) */
-        iris_gpu_rms_norm_f32(scratch->norm2, scratch->proj, block->attn_norm2,
-                               seq, dim, ZI_NORM_EPS);
-        iris_gpu_gated_add(hidden_gpu, gate_msa, scratch->norm2, seq, dim);
+        /* GPU: Fused attn_norm2 + gated residual: x += gate_msa * norm2(proj) */
+        iris_gpu_rms_norm_gated_add(hidden_gpu, scratch->proj,
+                                     block->attn_norm2, gate_msa,
+                                     seq, dim, ZI_NORM_EPS);
 
         /* CPU: fuse FFN norm weight * scale_mlp */
         float *fused_ffn_norm = scratch->fused_ffn_norm;
@@ -1079,10 +1075,10 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                     block->ffn_w2_bf16, block->ffn_w2,
                                     seq, ffn_dim, dim)) return 0;
 
-        /* GPU: ffn_norm2 + gated residual: x += gate_mlp * norm2(ffn_out) */
-        iris_gpu_rms_norm_f32(scratch->norm2, scratch->down, block->ffn_norm2,
-                               seq, dim, ZI_NORM_EPS);
-        iris_gpu_gated_add(hidden_gpu, gate_mlp, scratch->norm2, seq, dim);
+        /* GPU: Fused ffn_norm2 + gated residual: x += gate_mlp * norm2(ffn_out) */
+        iris_gpu_rms_norm_gated_add(hidden_gpu, scratch->down,
+                                     block->ffn_norm2, gate_mlp,
+                                     seq, dim, ZI_NORM_EPS);
 
     } else {
         /* ---- Unmodulated block (context_refiner) ---- */
@@ -1123,15 +1119,11 @@ static int zi_block_forward_gpu(iris_gpu_tensor_t hidden_gpu,
                                         seq, dim, dim)) return 0;
         }
 
-        /* GPU: QK normalization */
-        iris_gpu_qk_rms_norm(scratch->q, scratch->k,
-                              block->attn_norm_q, block->attn_norm_k,
-                              seq, n_heads, head_dim, ZI_NORM_EPS);
-
-        /* GPU: RoPE */
-        iris_gpu_rope_single_pair_f32(scratch->q, scratch->k,
+        /* GPU: Fused QK normalization + RoPE */
+        iris_gpu_qk_norm_rope_single(scratch->q, scratch->k,
+                                      block->attn_norm_q, block->attn_norm_k,
                                       rope_cos, rope_sin,
-                                      seq, n_heads, head_dim);
+                                      seq, n_heads, head_dim, ZI_NORM_EPS);
 
         /* GPU: Self-attention */
         float attn_scale = 1.0f / sqrtf((float)head_dim);

@@ -3122,6 +3122,11 @@ static id<MTLComputePipelineState> g_concat_attn_mlp_pipeline = nil;
 static id<MTLComputePipelineState> g_bmm_half_qkt_pipeline = nil;
 static id<MTLComputePipelineState> g_bmm_half_sv_pipeline = nil;
 static id<MTLComputePipelineState> g_softmax_half_pipeline = nil;
+/* Fused kernels */
+static id<MTLComputePipelineState> g_qk_norm_rope_2d_pipeline = nil;
+static id<MTLComputePipelineState> g_qk_norm_rope_unified_pipeline = nil;
+static id<MTLComputePipelineState> g_qk_norm_rope_single_pipeline = nil;
+static id<MTLComputePipelineState> g_rms_norm_gated_add_pipeline = nil;
 /* Note: BF16 pipelines are forward-declared at top of file */
 
 int iris_metal_shaders_available(void) {
@@ -3470,6 +3475,24 @@ int iris_metal_init_shaders(void) {
         func = [g_shader_library newFunctionWithName:@"upsample_nearest_2x_f32"];
         if (func) {
             g_upsample_nearest_2x_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        /* Fused kernels */
+        func = [g_shader_library newFunctionWithName:@"qk_norm_rope_2d"];
+        if (func) {
+            g_qk_norm_rope_2d_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+        func = [g_shader_library newFunctionWithName:@"qk_norm_rope_unified"];
+        if (func) {
+            g_qk_norm_rope_unified_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+        func = [g_shader_library newFunctionWithName:@"qk_norm_rope_single"];
+        if (func) {
+            g_qk_norm_rope_single_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+        func = [g_shader_library newFunctionWithName:@"rms_norm_gated_add"];
+        if (func) {
+            g_rms_norm_gated_add_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
         }
 
         g_shaders_initialized = 1;
@@ -4262,6 +4285,194 @@ void iris_gpu_gated_add(iris_gpu_tensor_t out, const float *gate,
             out->has_pending_work = 0;
             proj->has_pending_work = 0;
         }
+        /* ARC will release bufGate after command completes */
+    }
+}
+
+/* ========================================================================
+ * Fused QK RMSNorm + RoPE kernels
+ * ======================================================================== */
+
+/* Fused QK RMSNorm + unified text/image RoPE (Flux single blocks) */
+void iris_gpu_qk_norm_rope_unified(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
+                                    const float *q_weight, const float *k_weight,
+                                    const float *txt_cos, const float *txt_sin,
+                                    const float *img_cos, const float *img_sin,
+                                    int seq, int img_offset, int heads, int head_dim, float eps) {
+    if (!g_shaders_initialized || !g_qk_norm_rope_unified_pipeline || !q || !k) return;
+
+    int txt_seq = img_offset;
+    int img_seq = seq - img_offset;
+
+    @autoreleasepool {
+        size_t weight_size = (size_t)head_dim * sizeof(float);
+        size_t txt_freq_size = (size_t)txt_seq * head_dim * sizeof(float);
+        size_t img_freq_size = (size_t)img_seq * head_dim * sizeof(float);
+
+        id<MTLBuffer> bufQWeight = get_cached_weight_buffer(q_weight, weight_size);
+        id<MTLBuffer> bufKWeight = get_cached_weight_buffer(k_weight, weight_size);
+        id<MTLBuffer> bufTxtCos = pool_get_buffer(txt_freq_size);
+        id<MTLBuffer> bufTxtSin = pool_get_buffer(txt_freq_size);
+        id<MTLBuffer> bufImgCos = pool_get_buffer(img_freq_size);
+        id<MTLBuffer> bufImgSin = pool_get_buffer(img_freq_size);
+
+        if (!bufQWeight || !bufKWeight || !bufTxtCos || !bufTxtSin || !bufImgCos || !bufImgSin) {
+            if (bufTxtCos) pool_release_buffer(bufTxtCos);
+            if (bufTxtSin) pool_release_buffer(bufTxtSin);
+            if (bufImgCos) pool_release_buffer(bufImgCos);
+            if (bufImgSin) pool_release_buffer(bufImgSin);
+            return;
+        }
+
+        memcpy([bufTxtCos contents], txt_cos, txt_freq_size);
+        memcpy([bufTxtSin contents], txt_sin, txt_freq_size);
+        memcpy([bufImgCos contents], img_cos, img_freq_size);
+        memcpy([bufImgSin contents], img_sin, img_freq_size);
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_qk_norm_rope_unified_pipeline];
+        [encoder setBuffer:q->buffer offset:0 atIndex:0];
+        [encoder setBuffer:k->buffer offset:0 atIndex:1];
+        [encoder setBuffer:bufQWeight offset:0 atIndex:2];
+        [encoder setBuffer:bufKWeight offset:0 atIndex:3];
+        [encoder setBuffer:bufTxtCos offset:0 atIndex:4];
+        [encoder setBuffer:bufTxtSin offset:0 atIndex:5];
+        [encoder setBuffer:bufImgCos offset:0 atIndex:6];
+        [encoder setBuffer:bufImgSin offset:0 atIndex:7];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:8];
+        [encoder setBytes:&img_offset length:sizeof(int) atIndex:9];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:10];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:11];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:12];
+
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+        [encoder endEncoding];
+
+        q->has_pending_work = 1;
+        k->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            q->has_pending_work = 0;
+            k->has_pending_work = 0;
+        }
+
+        pool_release_buffer(bufTxtCos);
+        pool_release_buffer(bufTxtSin);
+        pool_release_buffer(bufImgCos);
+        pool_release_buffer(bufImgSin);
+    }
+}
+
+/* Fused QK RMSNorm + single-table consecutive-pair RoPE (Z-Image blocks) */
+void iris_gpu_qk_norm_rope_single(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
+                                   const float *q_weight, const float *k_weight,
+                                   const float *cos_freq, const float *sin_freq,
+                                   int seq, int heads, int head_dim, float eps) {
+    if (!g_shaders_initialized || !g_qk_norm_rope_single_pipeline || !q || !k) return;
+
+    @autoreleasepool {
+        size_t weight_size = (size_t)head_dim * sizeof(float);
+        size_t freq_size = (size_t)seq * head_dim * sizeof(float);
+
+        id<MTLBuffer> bufQWeight = get_cached_weight_buffer(q_weight, weight_size);
+        id<MTLBuffer> bufKWeight = get_cached_weight_buffer(k_weight, weight_size);
+        id<MTLBuffer> bufCos = pool_get_buffer(freq_size);
+        id<MTLBuffer> bufSin = pool_get_buffer(freq_size);
+
+        if (!bufQWeight || !bufKWeight || !bufCos || !bufSin) {
+            if (bufCos) pool_release_buffer(bufCos);
+            if (bufSin) pool_release_buffer(bufSin);
+            return;
+        }
+
+        memcpy([bufCos contents], cos_freq, freq_size);
+        memcpy([bufSin contents], sin_freq, freq_size);
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_qk_norm_rope_single_pipeline];
+        [encoder setBuffer:q->buffer offset:0 atIndex:0];
+        [encoder setBuffer:k->buffer offset:0 atIndex:1];
+        [encoder setBuffer:bufQWeight offset:0 atIndex:2];
+        [encoder setBuffer:bufKWeight offset:0 atIndex:3];
+        [encoder setBuffer:bufCos offset:0 atIndex:4];
+        [encoder setBuffer:bufSin offset:0 atIndex:5];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:6];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:8];
+
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+        [encoder endEncoding];
+
+        q->has_pending_work = 1;
+        k->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            q->has_pending_work = 0;
+            k->has_pending_work = 0;
+        }
+
+        pool_release_buffer(bufCos);
+        pool_release_buffer(bufSin);
+    }
+}
+
+/* Fused RMSNorm + gated residual add (Z-Image): out += gate * rms_norm(proj, weight) */
+void iris_gpu_rms_norm_gated_add(iris_gpu_tensor_t out, iris_gpu_tensor_t proj,
+                                  const float *weight, const float *gate,
+                                  int seq, int hidden, float eps) {
+    if (!g_shaders_initialized || !g_rms_norm_gated_add_pipeline || !out || !proj) return;
+
+    @autoreleasepool {
+        size_t vec_size = (size_t)hidden * sizeof(float);
+
+        /* Weight is a model parameter (static), gate is timestep-dependent. */
+        id<MTLBuffer> bufWeight = pool_get_buffer(vec_size);
+        id<MTLBuffer> bufGate = [g_device newBufferWithBytes:gate
+                                                      length:vec_size
+                                                     options:MTLResourceStorageModeShared];
+        if (!bufWeight || !bufGate) {
+            if (bufWeight) pool_release_buffer(bufWeight);
+            return;
+        }
+        memcpy([bufWeight contents], weight, vec_size);
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_rms_norm_gated_add_pipeline];
+        [encoder setBuffer:out->buffer offset:0 atIndex:0];
+        [encoder setBuffer:proj->buffer offset:0 atIndex:1];
+        [encoder setBuffer:bufWeight offset:0 atIndex:2];
+        [encoder setBuffer:bufGate offset:0 atIndex:3];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:4];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:5];
+
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)hidden);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        proj->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            proj->has_pending_work = 0;
+        }
+
+        pool_release_buffer(bufWeight);
         /* ARC will release bufGate after command completes */
     }
 }

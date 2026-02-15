@@ -387,6 +387,24 @@ void iris_gpu_silu_mul(iris_gpu_tensor_t gate, iris_gpu_tensor_t up, int n);
 void iris_gpu_gated_add(iris_gpu_tensor_t out, const float *gate,
                         iris_gpu_tensor_t proj, int seq, int hidden);
 
+/* Fused QK RMSNorm + unified text/image RoPE (Flux single blocks) */
+void iris_gpu_qk_norm_rope_unified(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
+                                    const float *q_weight, const float *k_weight,
+                                    const float *txt_cos, const float *txt_sin,
+                                    const float *img_cos, const float *img_sin,
+                                    int seq, int img_offset, int heads, int head_dim, float eps);
+
+/* Fused QK RMSNorm + single-table consecutive-pair RoPE (Z-Image blocks) */
+void iris_gpu_qk_norm_rope_single(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
+                                   const float *q_weight, const float *k_weight,
+                                   const float *cos_freq, const float *sin_freq,
+                                   int seq, int heads, int head_dim, float eps);
+
+/* Fused RMSNorm + gated residual add: out += gate * rms_norm(proj, weight) */
+void iris_gpu_rms_norm_gated_add(iris_gpu_tensor_t out, iris_gpu_tensor_t proj,
+                                  const float *weight, const float *gate,
+                                  int seq, int hidden, float eps);
+
 /* Split fused QKV+MLP output into separate tensors */
 void iris_gpu_split_qkv_mlp(iris_gpu_tensor_t fused,
                             iris_gpu_tensor_t q, iris_gpu_tensor_t k, iris_gpu_tensor_t v,
