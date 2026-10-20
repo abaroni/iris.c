@@ -136,6 +136,30 @@ FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike tr
 
 The model will generate a higher-resolution version while preserving the composition and details of the input.
 
+Image-to-image is generative reference conditioning: it can change details and
+does not guarantee an exact reconstruction. For upscaling, keep the original
+aspect ratio and use an explicit copy prompt as above.
+
+On Metal, native MPSGraph scaled dot-product attention keeps the reference at
+its own resolution (aligned to 16 pixels and limited by the VAE build ceiling).
+Older/manual attention paths may reduce reference resolution to keep their
+score matrices below 4 GiB. If the output alone leaves no room for references,
+Iris rejects the request instead of reducing the reference to 16x16.
+`IRIS_USE_MANUAL_SDPA=1` forces this conservative path for debugging.
+
+The default VAE ceiling is 1792 pixels per side. To build for 1920-pixel output
+on a machine with sufficient memory:
+
+```bash
+make mps MAX_IMAGE_DIM=1920
+./iris -d flux-klein-4b -i input.png -W 1920 -H 1280 \
+  -p "Create an exact copy of the input image." -o upscaled.png
+```
+
+1920x1280 preserves a 1536x1024 input's 3:2 aspect ratio. Increasing the build
+ceiling increases VAE working-memory reservations and does not guarantee
+better image quality or sufficient GPU memory.
+
 ### Multi-Reference Generation
 
 Combine elements from multiple reference images:
@@ -398,7 +422,9 @@ The following timings for 512x512 generation (Flux distilled model, 4 steps) wer
 
 ## Resolution Limits
 
-**Maximum resolution**: 1792x1792 pixels. The model produces good results up to this size; beyond this resolution image quality degrades significantly (this is a model limitation, not an implementation issue).
+**Default maximum resolution**: 1792x1792 pixels. This is the VAE build ceiling;
+it can be changed with `MAX_IMAGE_DIM` (see Super Resolution above). Higher
+resolutions require more memory and may reduce image quality.
 
 **Minimum resolution**: 64x64 pixels.
 

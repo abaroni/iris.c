@@ -3,7 +3,8 @@
 # Makefile
 
 CC = gcc
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
+MAX_IMAGE_DIM ?= 1792
+CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math -DIRIS_VAE_MAX_DIM=$(MAX_IMAGE_DIM)
 LDFLAGS = -lm
 
 # Platform detection

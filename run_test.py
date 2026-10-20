@@ -5,6 +5,7 @@ Usage: python3 run_test.py [--binary PATH] [--full]
 """
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,50 @@ TESTS = [
         "reference": "test_vectors/reference_img2img_256x256_seed456.png",
         "mean_diff_threshold": 20,
     },
+    {
+        "name": "reference resolution is independent of output resolution",
+        "prompt": "Create an exact copy of the input image.",
+        "seed": 42,
+        "steps": 2,
+        "width": 64,
+        "height": 64,
+        "input": "test_vectors/img2img_input_256x256.png",
+        "expect_stderr": "Reference image: 256x256 (output 64x64)",
+    },
+    {
+        "name": "impossible single-reference manual attention budget",
+        "prompt": "Create an exact copy of the input image.",
+        "seed": 42,
+        "steps": 1,
+        "width": 1792,
+        "height": 1792,
+        "input": "test_vectors/img2img_input_256x256.png",
+        "env": {"IRIS_USE_MANUAL_SDPA": "1"},
+        "expect_error": "Output exceeds the 4 GiB attention budget",
+    },
+    {
+        "name": "impossible multi-reference manual attention budget",
+        "prompt": "Create an exact copy of the input images.",
+        "seed": 42,
+        "steps": 1,
+        "width": 1792,
+        "height": 1792,
+        "input": "test_vectors/img2img_input_256x256.png",
+        "extra_inputs": ["test_vectors/img2img_input_256x256.png"],
+        "env": {"IRIS_USE_MANUAL_SDPA": "1"},
+        "expect_error": "Output exceeds the 4 GiB attention budget",
+    },
+    {
+        "name": "manual attention small-image numerical parity",
+        "prompt": "A fluffy orange cat sitting on a windowsill",
+        "seed": 42,
+        "steps": 2,
+        "width": 64,
+        "height": 64,
+        "env": {"IRIS_USE_MANUAL_SDPA": "1"},
+        "reference": "test_vectors/reference_2step_64x64_seed42.png",
+        "mean_diff_threshold": 20,
+    },
 ]
 
 # Full-only tests: these are slow and require visual inspection.
@@ -64,6 +109,7 @@ FULL_TESTS = [
         "width": 1024,
         "height": 1024,
         "expect_stderr": "reference image resized",
+        "env": {"IRIS_USE_MANUAL_SDPA": "1"},
         "visual_check": "a blue sports car on a rainy city street at night, "
                         "output is 1024x1024",
     },
@@ -139,9 +185,20 @@ def run_test(binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
     # Add input image for img2img tests
     if "input" in test:
         cmd.extend(["-i", test["input"]])
+    for path in test.get("extra_inputs", []):
+        cmd.extend(["-i", path])
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                                env={**os.environ, **test.get("env", {})})
+        if "expect_error" in test:
+            if result.returncode != 1:
+                return False, f"expected clean rejection (exit 1), got {result.returncode}"
+            if test["expect_error"] not in result.stderr:
+                return False, f"unexpected error: {result.stderr}"
+            if "Encoding reference image" in result.stderr:
+                return False, "budget was rejected after reference encoding started"
+            return True, "impossible budget rejected before reference encoding"
         if result.returncode != 0:
             return False, f"process exited with code {result.returncode}: {result.stderr}"
     except subprocess.TimeoutExpired:
