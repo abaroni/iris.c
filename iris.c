@@ -247,7 +247,7 @@ iris_ctx *iris_load_dir(const char *model_dir) {
         return NULL;
     }
 
-    /* Set defaults - max 1792x1792 (requires ~18GB VAE work buffers) */
+    /* Dimension ceiling is configurable at build time. */
     ctx->max_width = IRIS_VAE_MAX_DIM;
     ctx->max_height = IRIS_VAE_MAX_DIM;
     strncpy(ctx->model_version, "1.0", sizeof(ctx->model_version) - 1);
@@ -682,7 +682,7 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
     if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+        set_error("Image dimensions exceed the VAE build limit (MAX_IMAGE_DIM)");
         return NULL;
     }
 
@@ -809,7 +809,7 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
     if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+        set_error("Image dimensions exceed the VAE build limit (MAX_IMAGE_DIM)");
         return NULL;
     }
 
@@ -950,7 +950,7 @@ iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
     if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+        set_error("Image dimensions exceed the VAE build limit (MAX_IMAGE_DIM)");
         return NULL;
     }
 
@@ -1038,7 +1038,7 @@ iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
     if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+        set_error("Image dimensions exceed the VAE build limit (MAX_IMAGE_DIM)");
         return NULL;
     }
 

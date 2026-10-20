@@ -41,7 +41,9 @@ extern "C" {
 #define IRIS_VAE_CH_MULT_3      4
 #define IRIS_VAE_NUM_RES        2
 #define IRIS_VAE_GROUPS         32
+#ifndef IRIS_VAE_MAX_DIM
 #define IRIS_VAE_MAX_DIM        1792  /* Max image dimension for VAE */
+#endif
 
 /* Tokenizer */
 #define IRIS_MAX_SEQ_LEN        512
