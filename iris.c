@@ -1118,16 +1118,28 @@ static size_t attention_bytes(int num_heads,
     return (size_t)num_heads * total_seq * total_seq * sizeof(float);
 }
 
-/* Shrink reference pixel dimensions so attention fits under 4 GB.
+/* Shrink reference pixel dimensions so manual attention fits under 4 GiB.
  * ref_dims: [h0, w0, h1, w1, ...] in pixels, modified in-place.
- * Returns 1 if any reference was shrunk, 0 if already fits. */
+ * Native Metal SDPA does not materialize this quadratic score matrix.
+ * Returns -1 if output alone leaves no room for references, 1 if references
+ * were shrunk, or 0 if unchanged. */
 static int fit_refs_for_attention(int num_heads,
                                   int out_h, int out_w,
                                   int *ref_dims, int num_refs,
                                   int txt_seq)
 {
+#ifdef USE_METAL
+    if (iris_metal_has_memory_efficient_attention()) return 0;
+#endif
+    size_t min_seq = (size_t)(out_h / 16) * (out_w / 16) + txt_seq + num_refs;
+    if ((size_t)num_heads * min_seq * min_seq * sizeof(float) >= ATTENTION_MAX_BYTES) {
+        set_error("Output exceeds the 4 GiB attention budget even with minimum references; "
+                  "reduce output dimensions or use native Metal SDPA "
+                  "(unset IRIS_USE_MANUAL_SDPA)");
+        return -1;
+    }
     if (attention_bytes(num_heads, out_h, out_w,
-                        ref_dims, num_refs, txt_seq) <= ATTENTION_MAX_BYTES)
+                        ref_dims, num_refs, txt_seq) < ATTENTION_MAX_BYTES)
         return 0;
 
     int shrunk = 0;
@@ -1156,7 +1168,7 @@ static int fit_refs_for_attention(int num_heads,
         shrunk = 1;
 
         if (attention_bytes(num_heads, out_h, out_w,
-                            ref_dims, num_refs, txt_seq) <= ATTENTION_MAX_BYTES)
+                            ref_dims, num_refs, txt_seq) < ATTENTION_MAX_BYTES)
             break;
     }
     return shrunk;
@@ -1207,19 +1219,32 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
     p.width = (p.width / 16) * 16;
     p.height = (p.height / 16) * 16;
 
-    /* Check attention memory budget — shrink reference if needed. */
-    int ref_w = p.width, ref_h = p.height;
+    /* Reference resolution is independent of the requested output size. */
+    int ref_w = input->width, ref_h = input->height;
+    if (ref_w > IRIS_VAE_MAX_DIM || ref_h > IRIS_VAE_MAX_DIM) {
+        float scale = (float)IRIS_VAE_MAX_DIM / (ref_w > ref_h ? ref_w : ref_h);
+        ref_w = (int)(ref_w * scale);
+        ref_h = (int)(ref_h * scale);
+    }
+    ref_w = ref_w / 16 * 16;
+    ref_h = ref_h / 16 * 16;
+    if (ref_w < 16) ref_w = 16;
+    if (ref_h < 16) ref_h = 16;
     {
-        int ref_dims[2] = { p.height, p.width };
-        if (fit_refs_for_attention(ctx->num_heads, p.height, p.width,
-                                    ref_dims, 1, IRIS_MAX_SEQ_LEN)) {
+        int ref_dims[2] = { ref_h, ref_w };
+        int fit = fit_refs_for_attention(ctx->num_heads, p.height, p.width,
+                                         ref_dims, 1, IRIS_MAX_SEQ_LEN);
+        if (fit < 0) return NULL;
+        if (fit > 0) {
             fprintf(stderr, "Note: reference image resized from %dx%d to %dx%d "
                     "(GPU attention memory limit)\n",
-                    p.width, p.height, ref_dims[1], ref_dims[0]);
+                    ref_w, ref_h, ref_dims[1], ref_dims[0]);
             ref_h = ref_dims[0];
             ref_w = ref_dims[1];
         }
     }
+    fprintf(stderr, "Reference image: %dx%d (output %dx%d)\n",
+            ref_w, ref_h, p.width, p.height);
 
     /* Resize input if needed */
     iris_image *resized = NULL;
@@ -1429,33 +1454,6 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
     if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
     float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
 
-    /* Encode text */
-    int text_seq;
-    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
-    if (!text_emb) {
-        set_error("Failed to encode prompt");
-        return NULL;
-    }
-
-    float *text_emb_uncond = NULL;
-    int text_seq_uncond = 0;
-    if (!ctx->is_distilled) {
-        text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
-        if (!text_emb_uncond) {
-            free(text_emb);
-            set_error("Failed to encode empty prompt for CFG");
-            return NULL;
-        }
-    }
-
-    iris_release_text_encoder(ctx);
-
-    if (!iris_load_transformer_if_needed(ctx)) {
-        free(text_emb);
-        free(text_emb_uncond);
-        return NULL;
-    }
-
     /* Build reference pixel dimensions, clamped and rounded to 16. */
     int *ref_pixel_dims = (int *)malloc(num_refs * 2 * sizeof(int));
     for (int i = 0; i < num_refs; i++) {
@@ -1469,12 +1467,47 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
         ref_pixel_dims[i*2+1] = rw;
     }
 
-    /* Shrink references if attention would exceed 4 GB. */
-    if (fit_refs_for_attention(ctx->num_heads, p.height, p.width,
-                                ref_pixel_dims, num_refs, IRIS_MAX_SEQ_LEN)) {
+    /* Apply the conservative budget only when native SDPA is unavailable. */
+    int fit = fit_refs_for_attention(ctx->num_heads, p.height, p.width,
+                                     ref_pixel_dims, num_refs, IRIS_MAX_SEQ_LEN);
+    if (fit < 0) {
+        free(ref_pixel_dims);
+        return NULL;
+    }
+    if (fit > 0) {
         fprintf(stderr,
                 "Note: reference images resized to fit GPU attention "
                 "memory limit\n");
+    }
+
+    /* Encode text */
+    int text_seq;
+    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
+    if (!text_emb) {
+        free(ref_pixel_dims);
+        set_error("Failed to encode prompt");
+        return NULL;
+    }
+
+    float *text_emb_uncond = NULL;
+    int text_seq_uncond = 0;
+    if (!ctx->is_distilled) {
+        text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
+        if (!text_emb_uncond) {
+            free(text_emb);
+            free(ref_pixel_dims);
+            set_error("Failed to encode empty prompt for CFG");
+            return NULL;
+        }
+    }
+
+    iris_release_text_encoder(ctx);
+
+    if (!iris_load_transformer_if_needed(ctx)) {
+        free(text_emb);
+        free(text_emb_uncond);
+        free(ref_pixel_dims);
+        return NULL;
     }
 
     /* Encode all reference images */

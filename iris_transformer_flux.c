@@ -1395,6 +1395,20 @@ static int ensure_attn_scores(iris_transformer_flux_t *tf, int img_seq, int txt_
 #endif
 }
 
+/* Reference generation may use sequences too large for manual Metal attention.
+ * Only allocate its score buffer after the native BF16 path has been tried. */
+static int ensure_ref_fallback_scores_flux(iris_transformer_flux_t *tf, int img_seq, int txt_seq) {
+#ifdef USE_METAL
+    size_t total_seq = (size_t)img_seq + txt_seq;
+    if (iris_metal_available() &&
+        (size_t)tf->num_heads * total_seq * total_seq * sizeof(float) >= ((size_t)4 << 30)) {
+        fprintf(stderr, "Native Metal attention failed; manual attention would exceed 4 GiB\n");
+        return -1;
+    }
+#endif
+    return ensure_attn_scores(tf, img_seq, txt_seq);
+}
+
 /* Ensure all work buffers are allocated for the given sequence length.
  * Buffers are only reallocated if the current allocation is too small.
  * Returns 0 on success, -1 on allocation failure.
@@ -3995,10 +4009,6 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
         fprintf(stderr, "Failed to allocate work buffers for seq_len=%d\n", total_seq);
         return NULL;
     }
-    if (ensure_attn_scores(tf, combined_img_seq, txt_seq) < 0) {
-        fprintf(stderr, "Failed to allocate attention scores buffer\n");
-        return NULL;
-    }
 
     /* Get timestep embedding */
     int sincos_dim = tf->time_embed.sincos_dim;
@@ -4052,6 +4062,12 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
         }
     }
 #endif
+
+    if (ensure_ref_fallback_scores_flux(tf, combined_img_seq, txt_seq) < 0) {
+        free(combined_transposed);
+        free(t_emb);
+        return NULL;
+    }
 
     /* Project combined image latent to hidden */
     float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
@@ -4219,10 +4235,6 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
         fprintf(stderr, "Failed to allocate work buffers for seq_len=%d\n", total_seq);
         return NULL;
     }
-    if (ensure_attn_scores(tf, combined_img_seq, txt_seq) < 0) {
-        fprintf(stderr, "Failed to allocate attention scores buffer\n");
-        return NULL;
-    }
 
     /* Get timestep embedding */
     int sincos_dim = tf->time_embed.sincos_dim;
@@ -4296,6 +4308,14 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
         }
     }
 #endif
+
+    if (ensure_ref_fallback_scores_flux(tf, combined_img_seq, txt_seq) < 0) {
+        free(combined_transposed);
+        free(t_emb);
+        free(combined_rope_cos);
+        free(combined_rope_sin);
+        return NULL;
+    }
 
     /* Project combined image latent to hidden */
     float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
