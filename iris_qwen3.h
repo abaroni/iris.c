@@ -21,15 +21,19 @@ extern "C" {
 /* Fixed constants (same across model sizes) */
 #define QWEN3_VOCAB_SIZE       151936
 #define QWEN3_MAX_SEQ_LEN      512
+#define QWEN3_VL_MAX_SEQ_LEN   1280  /* Flux3 (Qwen3-VL): 16 windows of 80 tokens */
+#define QWEN3_FLUX3_PAD_MULTIPLE 80  /* Flux3 pads the prompt to a multiple of this */
 #define QWEN3_RMS_NORM_EPS     1e-6f
 #define QWEN3_ROPE_THETA       1000000.0f
 
-/* Output layers to extract (0-indexed)
- * Python uses hidden_states[9,18,27] which are outputs AFTER layers 8,17,26
- * since hidden_states[0] is embedding and hidden_states[i] is output after layer i-1 */
-#define QWEN3_OUTPUT_LAYER_1   8
-#define QWEN3_OUTPUT_LAYER_2   17
-#define QWEN3_OUTPUT_LAYER_3   26
+/* Maximum number of hidden-state layers concatenated into the embeddings
+ * (Flux3 stacks 8 of them). */
+#define QWEN3_MAX_OUTPUT_LAYERS 8
+
+/* Extraction modes, see qwen3_set_extraction_mode(). */
+#define QWEN3_EXTRACT_FLUX     0
+#define QWEN3_EXTRACT_ZIMAGE   1
+#define QWEN3_EXTRACT_FLUX3    2
 
 /* ========================================================================
  * Opaque Types
@@ -83,6 +87,8 @@ int qwen3_get_id(qwen3_tokenizer_t *tok, const char *token);
 /*
  * Load Qwen3 model weights from HuggingFace model directory.
  * Directory should contain model-00001-of-00002.safetensors, etc.
+ * Also accepts the text model of a Qwen3-VL checkpoint (Flux3), whose
+ * tensors live under "model.language_model.".
  */
 qwen3_model_t *qwen3_model_load(const char *model_dir);
 
@@ -98,8 +104,8 @@ void qwen3_model_free(qwen3_model_t *model);
  * attention_mask: Attention mask [seq_len] (1 for real tokens, 0 for padding)
  * seq_len: Length of input sequences
  *
- * Returns: Embedding array [seq_len, 7680] (caller must free)
- * Extracts hidden states from layers 9, 18, 27 and concatenates them.
+ * Returns: Embedding array [seq_len, text_dim] (caller must free)
+ * Concatenates the hidden states selected by the extraction mode.
  */
 float *qwen3_forward(qwen3_model_t *model,
                      const int *input_ids,
@@ -117,15 +123,20 @@ typedef struct qwen3_encoder {
 
 /*
  * Load complete text encoder (tokenizer + model).
- * model_dir should contain both tokenizer/ and text_encoder/ subdirectories.
+ * model_dir should contain text_encoder/ and the tokenizer, either in
+ * tokenizer/ or (Flux3) inside text_encoder/.
  * use_mmap: if true, use memory-mapped bf16 weights (saves ~8GB, slower inference)
  */
 qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap);
 
 /*
- * Set extraction mode:
- *   0 = Flux: layers 8,17,26 concatenated -> [seq, 3*hidden] (default)
- *   1 = Z-Image: layer (num_layers-2) only -> [seq, hidden]
+ * Set extraction mode (Python hidden_states[] indices):
+ *   QWEN3_EXTRACT_FLUX:   hidden_states[9,18,27] concatenated -> [seq, 3*hidden]
+ *   QWEN3_EXTRACT_ZIMAGE: hidden_states[-2] only -> [seq, hidden]
+ *   QWEN3_EXTRACT_FLUX3:  hidden_states[4,8,...,32] -> [seq, 8*hidden]
+ * Flux and Z-Image pad prompts to 512 tokens; Flux3 pads to a multiple of
+ * 80 tokens and places the padding at RoPE position 1, like the
+ * transformers version it was trained with.
  */
 void qwen3_set_extraction_mode(qwen3_encoder_t *enc, int mode);
 
@@ -136,19 +147,21 @@ void qwen3_encoder_free(qwen3_encoder_t *enc);
 
 /*
  * Encode text prompt to embeddings.
- * Returns: Embedding array [512, text_dim] (caller must free)
- * text_dim is 7680 for Flux mode, hidden_size for Z-Image mode.
+ * Returns: Embedding array [seq_len, text_dim] (caller must free), where
+ * seq_len is 512 except in Flux3 mode (see qwen3_encode_text_ex) and
+ * text_dim is hidden_size times the number of extracted layers.
  */
 float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt);
 
 /*
- * Encode text prompt to embeddings, returning actual token count.
+ * Encode text prompt to embeddings, returning token counts.
  * Same as qwen3_encode_text but also returns the number of real
- * (non-padding) tokens in *out_num_tokens.
- * Returns: Embedding array [512, text_dim] (caller must free)
+ * (non-padding) tokens in *out_num_tokens and the padded sequence
+ * length (rows of the returned array) in *out_seq_len. Both may be NULL.
+ * Returns: Embedding array [seq_len, text_dim] (caller must free)
  */
 float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
-                              int *out_num_tokens);
+                              int *out_num_tokens, int *out_seq_len);
 
 #ifdef __cplusplus
 }

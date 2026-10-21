@@ -215,6 +215,25 @@ float *iris_schedule_zimage(int num_steps, int image_seq_len) {
     return schedule;
 }
 
+/*
+ * FLUX.3 schedule: the pipeline passes sigmas = linspace(1, 1/n, n) to
+ * FlowMatch Euler with a static shift of 6.93 (which keeps the noise level
+ * high for most of the run), then the terminal sigma 0 is appended.
+ */
+float *iris_schedule_flux3(int num_steps) {
+    float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    const float shift = 6.93f;
+
+    for (int i = 0; i < num_steps; i++) {
+        float u = (num_steps > 1) ? (float)i / (float)(num_steps - 1) : 0.0f;
+        float raw = 1.0f + (1.0f / num_steps - 1.0f) * u;
+        schedule[i] = shift * raw / (1.0f + (shift - 1.0f) * raw);
+    }
+    schedule[num_steps] = 0.0f;
+
+    return schedule;
+}
+
 /* ========================================================================
  * Euler Sampler for Rectified Flow
  * ======================================================================== */
@@ -884,6 +903,101 @@ float *iris_sample_euler_cfg_multirefs_flux(void *transformer, void *text_encode
     }
 
     iris_transformer_free_mmap_cache_flux(tf);
+    return z_curr;
+}
+
+/* ========================================================================
+ * FLUX.3 Sampler
+ * ======================================================================== */
+
+typedef struct iris_transformer_flux3 iris_transformer_flux3_t;
+extern float *iris_transformer_forward_flux3(iris_transformer_flux3_t *tf,
+                                             const float *img, int img_h, int img_w,
+                                             const float *txt, int txt_seq,
+                                             const float *const *refs, const int *ref_h,
+                                             const int *ref_w, int num_refs,
+                                             float t, float t_target);
+
+/* Euler sampler for FLUX.3: z_{n+1} = z_n + (sigma_{n+1} - sigma_n) * v.
+ * The transformer gets sigma as timestep; flow-map (distilled) models also
+ * get the sigma the step jumps to. With uncond_emb (base models) each step
+ * runs the transformer twice for classifier-free guidance:
+ * v = v_uncond + guidance * (v_cond - v_uncond). Reference latents, if any,
+ * condition every pass (in-context conditioning). */
+float *iris_sample_euler_flux3(void *transformer,
+                               const float *z, int channels, int h, int w,
+                               const float *text_emb, int text_seq,
+                               const float *uncond_emb, int uncond_seq,
+                               const float *const *refs, const int *ref_h,
+                               const int *ref_w, int num_refs,
+                               const float *schedule, int num_steps,
+                               float guidance,
+                               void (*progress_callback)(int step, int total)) {
+    iris_transformer_flux3_t *tf = (iris_transformer_flux3_t *)transformer;
+    int latent_size = channels * h * w;
+
+    float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    iris_copy(z_curr, z, latent_size);
+
+    double total_start = get_time_ms();
+    double step_times[IRIS_MAX_STEPS];
+
+    for (int step = 0; step < num_steps; step++) {
+        float sigma = schedule[step];
+        float sigma_next = schedule[step + 1];
+        double step_start = get_time_ms();
+
+        if (iris_step_callback)
+            iris_step_callback(step + 1, num_steps);
+
+        float *v = iris_transformer_forward_flux3(tf, z_curr, h, w, text_emb, text_seq,
+                                                  refs, ref_h, ref_w, num_refs,
+                                                  sigma, sigma_next);
+        if (v && uncond_emb) {
+            float *v_uncond = iris_transformer_forward_flux3(tf, z_curr, h, w,
+                                                             uncond_emb, uncond_seq,
+                                                             refs, ref_h, ref_w, num_refs,
+                                                             sigma, sigma_next);
+            if (!v_uncond) {
+                free(v);
+                v = NULL;
+            } else {
+                for (int i = 0; i < latent_size; i++)
+                    v[i] = v_uncond[i] + guidance * (v[i] - v_uncond[i]);
+                free(v_uncond);
+            }
+        }
+        if (!v) {
+            free(z_curr);
+            return NULL;
+        }
+
+        iris_axpy(z_curr, sigma_next - sigma, v, latent_size);
+        free(v);
+
+        if (step < IRIS_MAX_STEPS) step_times[step] = get_time_ms() - step_start;
+
+        if (progress_callback)
+            progress_callback(step + 1, num_steps);
+
+        if (iris_step_image_callback && iris_step_image_vae && step + 1 < num_steps) {
+            iris_image *img = iris_vae_decode((iris_vae_t *)iris_step_image_vae,
+                                              z_curr, 1, h, w);
+            if (img) {
+                iris_step_image_callback(step + 1, num_steps, img);
+                iris_image_free(img);
+            }
+        }
+    }
+
+    if (iris_verbose) {
+        fprintf(stderr, "\nDenoising timing breakdown (FLUX.3):\n");
+        for (int step = 0; step < num_steps && step < IRIS_MAX_STEPS; step++)
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        double total = get_time_ms() - total_start;
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total, total / 1000.0);
+    }
+
     return z_curr;
 }
 

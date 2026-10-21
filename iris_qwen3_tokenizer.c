@@ -419,7 +419,8 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
     }
 
     /* Parse merges from "model": { "merges": [ ... ] }
-     * Merges are arrays like: [["Ġ", "Ġ"], ["ĠĠ", "ĠĠ"], ...]
+     * Merges are pairs like [["Ġ", "Ġ"], ["ĠĠ", "ĠĠ"], ...] or, in the
+     * older format (Qwen3-VL), strings like ["Ġ Ġ", "ĠĠ ĠĠ", ...].
      */
     p = strstr(json, "\"merges\"");
     if (!p) {
@@ -431,7 +432,7 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
     if (!p) goto error;
     p++;
 
-    /* Count merges by counting '[' characters at depth 1 */
+    /* Count merges by counting the '[' or '"' elements at depth 1 */
     int merge_count = 0;
     count_p = p;
     depth = 1;
@@ -442,6 +443,7 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
         } else if (*count_p == ']') {
             depth--;
         } else if (*count_p == '"') {
+            if (depth == 1) merge_count++;
             count_p++;
             while (*count_p && *count_p != '"') {
                 if (*count_p == '\\' && count_p[1]) count_p += 2;
@@ -461,32 +463,44 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
         tok->merge_ranks[i] = -1;
     }
 
-    /* Parse merges - format is [["left", "right"], ...] */
+    /* Parse merges */
     p = skip_ws(p);
     int merge_idx = 0;
     while (*p && *p != ']' && merge_idx < merge_count) {
-        if (*p == '[') {
-            p++;
-            p = skip_ws(p);
-
-            /* Parse left string */
+        if (*p == '[' || *p == '"') {
             char *left = NULL;
             char *right = NULL;
             if (*p == '"') {
-                left = parse_json_string(&p);
-            }
-            p = skip_ws(p);
-            if (*p == ',') p++;
-            p = skip_ws(p);
+                /* "left right": tokens never contain a literal space */
+                char *pair = parse_json_string(&p);
+                char *sp = pair ? strchr(pair, ' ') : NULL;
+                if (sp) {
+                    *sp = '\0';
+                    left = strdup(pair);
+                    right = strdup(sp + 1);
+                }
+                free(pair);
+            } else {
+                p++;
+                p = skip_ws(p);
 
-            /* Parse right string */
-            if (*p == '"') {
-                right = parse_json_string(&p);
-            }
+                /* Parse left string */
+                if (*p == '"') {
+                    left = parse_json_string(&p);
+                }
+                p = skip_ws(p);
+                if (*p == ',') p++;
+                p = skip_ws(p);
 
-            /* Skip to closing ] */
-            while (*p && *p != ']') p++;
-            if (*p == ']') p++;
+                /* Parse right string */
+                if (*p == '"') {
+                    right = parse_json_string(&p);
+                }
+
+                /* Skip to closing ] */
+                while (*p && *p != ']') p++;
+                if (*p == ']') p++;
+            }
 
             if (left && right) {
                 tok->merges[merge_idx].left = left;

@@ -6,6 +6,7 @@ flux
 
 # Model weights (large files)
 flux-klein-*/
+flux-3-klein*/
 zimage-*/
 
 # Tokens and planning docs

@@ -21,6 +21,8 @@ MODELS = {
     "9b": ("black-forest-labs/FLUX.2-klein-9B", "./flux-klein-9b"),
     "9b-base": ("black-forest-labs/FLUX.2-klein-base-9B", "./flux-klein-9b-base"),
     "zimage-turbo": ("Tongyi-MAI/Z-Image-Turbo", "./zimage-turbo"),
+    "flux3": ("black-forest-labs/flux-3-image-klein", "./flux-3-klein"),
+    "flux3-base": ("black-forest-labs/flux-3-image-klein-base", "./flux-3-klein-base"),
 }
 
 USAGE_TEXT = """\
@@ -35,6 +37,8 @@ Available models:
   9b            Distilled 9B (4 steps, higher quality, non-commercial, ~30 GB disk)
   9b-base       Base 9B (50 steps, CFG, highest quality, non-commercial, ~30 GB disk)
   zimage-turbo  Z-Image-Turbo 6B (8 NFE / 9 scheduler steps, Apache 2.0, ~22 GB disk)
+  flux3         FLUX.3 Image Klein 5.6B (16 steps, Kommunity license, ~21 GB disk)
+  flux3-base    FLUX.3 Image Klein Base 5.6B (50 steps, CFG, Kommunity license, ~21 GB disk)
 
 By default this implementation uses mmap() so inference is often
 possible with less RAM than the model size.
@@ -96,6 +100,7 @@ def main():
     # Files to download - VAE, transformer, Qwen3 text encoder, and model_index.json
     patterns = [
         "model_index.json",
+        "modular_model_index.json",
         "vae/*.safetensors",
         "vae/*.json",
         "transformer/*.safetensors",

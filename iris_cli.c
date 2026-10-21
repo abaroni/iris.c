@@ -83,13 +83,9 @@ static const char *schedule_name(int sched) {
     case IRIS_SCHEDULE_FLOWMATCH: return "flowmatch";
     default:
         if (iris_is_zimage(state.ctx)) return "flowmatch (default)";
+        if (iris_is_flux3(state.ctx)) return "shifted flowmatch (default)";
         return "sigmoid (default)";
     }
-}
-
-static int cli_default_steps(iris_ctx *ctx) {
-    if (iris_is_zimage(ctx)) return 9;
-    return iris_is_distilled(ctx) ? 4 : 50;
 }
 
 /* ======================================================================
@@ -741,7 +737,7 @@ static void cmd_steps(char *arg) {
     int val = atoi(arg);
     if (val == 0) {
         /* Reset to model default */
-        state.steps = cli_default_steps(state.ctx);
+        state.steps = iris_default_steps(state.ctx);
         printf("Steps: %d (auto)\n", state.steps);
         return;
     }
@@ -1105,6 +1101,8 @@ static void print_banner(void) {
 
     if (iris_is_zimage(state.ctx)) {
         printf("Type: Z-Image-Turbo (S3-DiT)\n");
+    } else if (iris_is_flux3(state.ctx)) {
+        printf("Type: FLUX.3 %s\n", iris_is_distilled(state.ctx) ? "distilled" : "base (CFG)");
     } else {
         printf("Type: %s\n", iris_is_distilled(state.ctx) ? "distilled" : "base (CFG)");
     }
@@ -1122,7 +1120,7 @@ int iris_cli_run(iris_ctx *ctx, const char *model_dir) {
     state.width = CLI_DEFAULT_WIDTH;
     state.height = CLI_DEFAULT_HEIGHT;
     /* Use model defaults for steps and guidance */
-    state.steps = cli_default_steps(ctx);
+    state.steps = iris_default_steps(ctx);
     state.guidance = 0.0f;  /* 0 = auto from model type */
     state.seed = -1;
     state.power_alpha = 2.0f;

@@ -13,6 +13,8 @@ show_usage() {
     echo "  9b            Distilled 9B (4 steps, higher quality, non-commercial, ~30 GB disk)"
     echo "  9b-base       Base 9B (50 steps, CFG, highest quality, non-commercial, ~30 GB disk)"
     echo "  zimage-turbo  Z-Image-Turbo 6B (8 NFE / 9 scheduler steps, Apache 2.0, ~22 GB disk)"
+    echo "  flux3         FLUX.3 Image Klein 5.6B (16 steps, Kommunity license, ~21 GB disk)"
+    echo "  flux3-base    FLUX.3 Image Klein Base 5.6B (50 steps, CFG, Kommunity license, ~21 GB disk)"
     echo ""
     echo "By default this implementation uses mmap() so inference is often"
     echo "possible with less RAM than the model size."
@@ -53,6 +55,16 @@ case "$MODEL" in
         ORG="Tongyi-MAI"
         REPO="Z-Image-Turbo"
         OUT="./zimage-turbo"
+        ;;
+    flux3)
+        REPO="flux-3-image-klein"
+        OUT="./flux-3-klein"
+        FLUX3=1
+        ;;
+    flux3-base)
+        REPO="flux-3-image-klein-base"
+        OUT="./flux-3-klein-base"
+        FLUX3=1
         ;;
     *)
         echo "Unknown model: $MODEL"
@@ -122,10 +134,19 @@ dl() {
     fi
 }
 
-mkdir -p "$OUT"/{text_encoder,tokenizer,transformer,vae}
-
-# model_index.json (needed for autodetection)
-dl "$OUT/model_index.json" "$BASE/model_index.json"
+if [ -n "$FLUX3" ]; then
+    # FLUX.3 ships a modular pipeline index and keeps the tokenizer in text_encoder/
+    mkdir -p "$OUT"/{text_encoder,transformer,vae}
+    dl "$OUT/modular_model_index.json" "$BASE/modular_model_index.json"
+    TOK_DIR="text_encoder"
+    TOK_FILES="chat_template.json merges.txt tokenizer.json tokenizer_config.json vocab.json"
+else
+    mkdir -p "$OUT"/{text_encoder,tokenizer,transformer,vae}
+    # model_index.json (needed for autodetection)
+    dl "$OUT/model_index.json" "$BASE/model_index.json"
+    TOK_DIR="tokenizer"
+    TOK_FILES="added_tokens.json chat_template.jinja merges.txt special_tokens_map.json tokenizer.json tokenizer_config.json vocab.json"
+fi
 
 # text_encoder (Qwen3 - ~8GB for 4B, ~16GB for 9B)
 dl "$OUT/text_encoder/config.json" "$BASE/text_encoder/config.json"
@@ -152,13 +173,9 @@ for shard in $SHARDS; do
 done
 
 # tokenizer
-dl "$OUT/tokenizer/added_tokens.json" "$BASE/tokenizer/added_tokens.json"
-dl "$OUT/tokenizer/chat_template.jinja" "$BASE/tokenizer/chat_template.jinja"
-dl "$OUT/tokenizer/merges.txt" "$BASE/tokenizer/merges.txt"
-dl "$OUT/tokenizer/special_tokens_map.json" "$BASE/tokenizer/special_tokens_map.json"
-dl "$OUT/tokenizer/tokenizer.json" "$BASE/tokenizer/tokenizer.json"
-dl "$OUT/tokenizer/tokenizer_config.json" "$BASE/tokenizer/tokenizer_config.json"
-dl "$OUT/tokenizer/vocab.json" "$BASE/tokenizer/vocab.json"
+for f in $TOK_FILES; do
+    dl "$OUT/$TOK_DIR/$f" "$BASE/$TOK_DIR/$f"
+done
 
 # transformer
 dl "$OUT/transformer/config.json" "$BASE/transformer/config.json"

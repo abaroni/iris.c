@@ -13,6 +13,10 @@ Supported model families:
   - **9B base** (50 steps, CFG, highest quality. Non-commercial license).
 - **[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)** (by Tongyi-MAI):
   - **6B** (8 NFE / 9 scheduler steps, no CFG, fast).
+- **[FLUX.3 Image Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein)** (by [Black Forest Labs](https://bfl.ai/)):
+  - **5.6B distilled** (16 steps by default, trained for 4 to 16, no CFG. FLUX Kommunity License).
+  - **5.6B base** (50 steps, CFG. FLUX Kommunity License).
+  - Text-to-image only for now (reference images are not supported yet).
 
 ## Quick Start
 
@@ -53,6 +57,13 @@ For Z-Image-Turbo:
 # Download Z-Image-Turbo (~12GB)
 pip install huggingface_hub && python download_model.py zimage-turbo
 ./iris -d zimage-turbo -p "a fish" -o fish.png
+```
+
+For FLUX.3 Image Klein (gated, accept the license on HuggingFace first, ~20GB):
+```bash
+./download_model.sh flux3 --token YOUR_TOKEN
+# or: python download_model.py flux3 --token YOUR_TOKEN
+./iris -d flux-3-klein -p "a fish" -o fish.png
 ```
 
 That's it. No Python runtime or CUDA toolkit required at inference time.
@@ -315,6 +326,7 @@ The tests compare generated images against reference images in `test_vectors/`. 
 | Full | 512x512 | 4 | Validates txt2img at larger resolution |
 | img2img | 256x256 | 4 | Validates image-to-image transformation |
 | Z-Image | 256x256 | 2 | Z-Image smoke test (auto-detected) |
+| FLUX.3 | 256x256 | 4 | FLUX.3 Klein against the official pipeline (auto-detected) |
 
 You can also run the test script directly for more options:
 ```bash
@@ -355,6 +367,14 @@ Download model weights from HuggingFace using one of these methods:
 pip install huggingface_hub && python download_model.py zimage-turbo
 ```
 
+**FLUX.3 Image Klein** (~20GB, FLUX Kommunity License):
+```bash
+# Gated: accept the license at https://huggingface.co/black-forest-labs/flux-3-image-klein
+./download_model.sh flux3 --token YOUR_TOKEN        # distilled
+./download_model.sh flux3-base --token YOUR_TOKEN   # base (CFG)
+# or: python download_model.py flux3 --token YOUR_TOKEN
+```
+
 | Model | Directory | Size | Components |
 |-------|-----------|------|------------|
 | 4B distilled | `./flux-klein-4b` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
@@ -362,6 +382,8 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 | 9B distilled | `./flux-klein-9b` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
 | 9B base | `./flux-klein-9b-base` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
 | Z-Image-Turbo | `./zimage-turbo` | ~12GB | VAE, Transformer (~6B), Qwen3-4B |
+| FLUX.3 distilled | `./flux-3-klein` | ~20GB | VAE (~300MB), Transformer (~11GB), Qwen3-VL-4B (~9GB) |
+| FLUX.3 base | `./flux-3-klein-base` | ~20GB | VAE (~300MB), Transformer (~11GB), Qwen3-VL-4B (~9GB) |
 
 ## How Fast Is It?
 
@@ -448,6 +470,23 @@ Z-Image-Turbo uses an S3-DiT single-stream architecture with noise and context r
 | Text Encoder | Qwen3-4B (hidden_states[-2]) |
 | VAE | 16 latent channels, patch_size=2 |
 
+### FLUX.3 Image Klein
+
+FLUX.3 processes three token modes (text, image, reference images): each first goes through its own blocks, attending only within the mode, then all of them are joined for the shared blocks:
+
+| Component | FLUX.3 Image Klein |
+|-----------|--------------------|
+| Transformer hidden | 3072 |
+| Attention heads | 24 (head dim 128) |
+| Per-mode blocks | 5 per mode (separate weights for text, image, references) |
+| Joint blocks | 28 over `[TEXT, IMAGE, REFS]` |
+| Block | parallel attention + SwiGLU FFN, one gated residual |
+| RoPE | 4 axes (t, h, w, l) x 32 dims, theta 10000, image positions scaled by 0.5 |
+| Text Encoder | Qwen3-VL-4B text model, hidden_states[4, 8, ..., 32] concatenated (20480 dims) |
+| VAE | Same as FLUX.2 |
+
+Image tokens are modulated by the timestep, text and reference tokens by timestep 0. The distilled checkpoint is a flow map: every step is also told the timestep it jumps to. The prompt is padded to a multiple of 80 tokens and the transformer attends to the padding too, so the padding is part of the model recipe.
+
 ## Timestep Schedules
 
 Each model family has its own default schedule. Alternative schedules (`--linear`, `--power`, `--sigmoid`, `--flowmatch`) are available for experimentation. Any schedule can be used with any model.
@@ -488,6 +527,15 @@ For quick tests, **4 steps with `--linear`** works well and is twice as fast as 
 
 # Quick test: 4 steps with linear schedule
 ./iris -d zimage-turbo -p "a fish" -o fish.png -s 4 --linear
+```
+
+### FLUX.3 Image Klein
+
+FLUX.3 uses FlowMatch Euler with a large static shift (6.93), which keeps the noise level high for most of the run. The distilled model defaults to 16 steps but was trained for 4 to 16, so fewer steps are a valid speed/quality trade-off:
+
+```bash
+./iris -d flux-3-klein -p "a fish" -o fish.png          # 16 steps
+./iris -d flux-3-klein -p "a fish" -o fish.png -s 4     # 4x faster
 ```
 
 ### Cross-model schedules

@@ -5499,6 +5499,15 @@ void iris_gpu_rope_2d_bf16(iris_gpu_tensor_t x,
     }
 }
 
+/* Threads per threadgroup for the causal attention kernels: one per key up
+ * to 256, rounded down to a power of two as their tree reductions require
+ * (Flux3 text windows are multiples of 80 tokens, not of 32). */
+static NSUInteger attention_threads(int seq) {
+    NSUInteger n = 1;
+    while (n * 2 <= 256 && n * 2 <= (NSUInteger)seq) n *= 2;
+    return n;
+}
+
 /* BF16 Causal Attention with GQA support (for text encoder) */
 int iris_gpu_causal_attention_bf16(iris_gpu_tensor_t out,
                                     iris_gpu_tensor_t Q, iris_gpu_tensor_t K, iris_gpu_tensor_t V,
@@ -5549,7 +5558,7 @@ int iris_gpu_causal_attention_bf16(iris_gpu_tensor_t out,
         [encoder setBytes:&scale length:sizeof(float) atIndex:9];
         [encoder setBytes:&use_mask length:sizeof(int) atIndex:10];
 
-        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq);
+        NSUInteger threadsPerGroup = attention_threads(seq);
         [encoder dispatchThreadgroups:MTLSizeMake(seq, num_q_heads, 1)
                 threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
         [encoder endEncoding];
@@ -5587,8 +5596,13 @@ void iris_gpu_rope_text_bf16(iris_gpu_tensor_t q, iris_gpu_tensor_t k,
         int half_dim = head_dim / 2;
         size_t freq_size = (size_t)seq * half_dim * sizeof(float);
 
-        id<MTLBuffer> bufCos = get_rope_buffer(cos_cache, freq_size);
-        id<MTLBuffer> bufSin = get_rope_buffer(sin_cache, freq_size);
+        /* Not get_rope_buffer(): the text encoder refills its tables for
+         * every prompt (Flux3 padding positions), so a pointer-keyed cache
+         * would serve stale rows. The tables are small. */
+        id<MTLBuffer> bufCos = [g_device newBufferWithBytes:cos_cache length:freq_size
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bufSin = [g_device newBufferWithBytes:sin_cache length:freq_size
+                                                    options:MTLResourceStorageModeShared];
         if (!bufCos || !bufSin) return;
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
@@ -6277,7 +6291,7 @@ int iris_metal_causal_attention(float *out,
 
         /* Dispatch: one threadgroup per (query_pos, head) pair
          * Each threadgroup has threads for parallel reduction (softmax) */
-        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq);
+        NSUInteger threadsPerGroup = attention_threads(seq);
         [encoder dispatchThreadgroups:MTLSizeMake(seq, num_q_heads, 1)
                 threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
 

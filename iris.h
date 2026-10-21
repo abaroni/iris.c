@@ -141,6 +141,17 @@ int iris_is_distilled(iris_ctx *ctx);
 int iris_is_zimage(iris_ctx *ctx);
 
 /*
+ * Check if model is FLUX.3 (Image Klein).
+ */
+int iris_is_flux3(iris_ctx *ctx);
+
+/*
+ * Default number of steps and guidance scale for the loaded model.
+ */
+int iris_default_steps(iris_ctx *ctx);
+float iris_default_guidance(iris_ctx *ctx);
+
+/*
  * Force base model mode (overrides autodetection).
  * Call after iris_load_dir() if model_index.json is missing.
  */
@@ -258,6 +269,12 @@ int iris_text_dim(iris_ctx *ctx);
  * Check if model has non-commercial license (e.g., 9B model).
  */
 int iris_is_non_commercial(iris_ctx *ctx);
+
+/*
+ * License notice to show the user for models with usage restrictions,
+ * or NULL for permissively licensed models.
+ */
+const char *iris_license_notice(iris_ctx *ctx);
 
 /*
  * Get last error message.

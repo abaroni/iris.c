@@ -81,6 +81,30 @@ ZIMAGE_SMOKE_TEST = {
 }
 
 
+# Optional FLUX.3 test, run only if a FLUX.3 model directory is found.
+# The reference was produced by debug/flux3_reference.py (official diffusers
+# pipeline, float32) starting from the noise iris generates for seed 42.
+FLUX3_TEST = {
+    "name": "FLUX.3 Klein test (4 steps, 256x256)",
+    "prompt": "A fluffy orange cat sitting on a windowsill",
+    "seed": 42,
+    "steps": 4,
+    "width": 256,
+    "height": 256,
+    "reference": "test_vectors/reference_flux3_4step_256x256_seed42.png",
+    "mean_diff_threshold": 20,
+}
+
+
+def is_flux3_model_dir(model_dir: Path) -> bool:
+    """Return True if model_dir looks like a FLUX.3 model directory."""
+    config = model_dir / "transformer" / "config.json"
+    try:
+        return "Flux3Transformer2DModel" in config.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+
 def is_zimage_model_dir(model_dir: Path) -> bool:
     """Return True if model_dir looks like a Z-Image model directory."""
     if not model_dir.is_dir():
@@ -98,20 +122,20 @@ def is_zimage_model_dir(model_dir: Path) -> bool:
     return ("ZImagePipeline" in text) or ("Z-Image" in text)
 
 
-def detect_zimage_model_dir(explicit_dir: Optional[str]) -> Optional[Path]:
-    """Find a Z-Image model directory."""
+def detect_model_dir(explicit_dir: Optional[str], common_names, matches) -> Optional[Path]:
+    """Find a model directory for which matches(dir) is true."""
     if explicit_dir:
         p = Path(explicit_dir)
-        return p if is_zimage_model_dir(p) else None
+        return p if matches(p) else None
 
     # Common local names first.
-    for p in (Path("zimage-turbo"), Path("zimage"), Path("Z-Image-Turbo")):
-        if is_zimage_model_dir(p):
-            return p
+    for name in common_names:
+        if matches(Path(name)):
+            return Path(name)
 
     # Fallback: scan direct subdirectories.
     for p in sorted(Path(".").iterdir()):
-        if p.is_dir() and is_zimage_model_dir(p):
+        if p.is_dir() and matches(p):
             return p
 
     return None
@@ -195,6 +219,8 @@ def main():
     parser.add_argument("--model-dir", default="flux-klein-4b", help="Path to model")
     parser.add_argument("--zimage-model-dir", default=None,
                         help="Optional Z-Image model dir (auto-detected if omitted)")
+    parser.add_argument("--flux3-model-dir", default=None,
+                        help="Optional FLUX.3 model dir (auto-detected if omitted)")
     parser.add_argument("--quick", action="store_true", help="Run only the quick 64x64 test")
     parser.add_argument("--full", action="store_true",
                         help="Also run slow tests that require visual inspection")
@@ -206,18 +232,26 @@ def main():
         tests_to_run = list(TESTS)
     full_tests_to_run = list(FULL_TESTS) if args.full else []
 
-    # Optional zImage coverage: run only in non-quick mode.
+    # Optional Z-Image and FLUX.3 coverage: run only in non-quick mode.
     scheduled_tests: list[tuple[dict, str]] = [(t, args.model_dir) for t in tests_to_run]
-    zimage_dir = detect_zimage_model_dir(args.zimage_model_dir)
-    if not args.quick:
-        if zimage_dir:
-            print(f"Detected Z-Image model dir: {zimage_dir}")
-            scheduled_tests.append((ZIMAGE_SMOKE_TEST, str(zimage_dir)))
-        elif args.zimage_model_dir:
-            print(f"Warning: --zimage-model-dir '{args.zimage_model_dir}' is not a valid Z-Image model dir")
-            print("Skipping optional Z-Image smoke test.")
+    optional = [
+        ("Z-Image", "--zimage-model-dir", args.zimage_model_dir, ZIMAGE_SMOKE_TEST,
+         ("zimage-turbo", "zimage", "Z-Image-Turbo"), is_zimage_model_dir),
+        ("FLUX.3", "--flux3-model-dir", args.flux3_model_dir, FLUX3_TEST,
+         ("flux-3-klein", "flux-3-klein-base"), is_flux3_model_dir),
+    ]
+    for label, flag, explicit, test, names, matches in optional:
+        if args.quick:
+            break
+        model_dir = detect_model_dir(explicit, names, matches)
+        if model_dir:
+            print(f"Detected {label} model dir: {model_dir}")
+            scheduled_tests.append((test, str(model_dir)))
+        elif explicit:
+            print(f"Warning: {flag} '{explicit}' is not a valid {label} model dir")
+            print(f"Skipping optional {label} test.")
         else:
-            print("No Z-Image model dir detected; skipping optional Z-Image smoke test.")
+            print(f"No {label} model dir detected; skipping optional {label} test.")
 
     total = len(scheduled_tests) + len(full_tests_to_run)
     print(f"Running {total} test(s)...\n")

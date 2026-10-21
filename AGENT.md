@@ -1,6 +1,7 @@
-This is a C implementation of two image synthesis model families:
+This is a C implementation of three image synthesis model families:
 - Flux.2 Klein (4B and 9B variants)
 - Z-Image-Turbo (6B)
+- FLUX.3 Image Klein (5.6B)
 
 The project is called "Iris" (from the Greek goddess of the rainbow).
 The Flux models are created by Black Forest Labs.
@@ -14,6 +15,7 @@ Do not rely on hardcoded dimensions when a config value is available.
 - **`iris_`** prefix for all shared/generic identifiers
 - **`_flux`** postfix on internal functions/types specific to the Flux model family
 - **`_zimage`** postfix on internal functions/types specific to Z-Image
+- **`_flux3`** postfix on internal functions/types specific to FLUX.3
 - **No postfix** on public API functions (they route internally by model type)
 - **Unchanged**: `qwen3_*`, `safetensors_*`, `zi_*` internal helpers (component-level namespaces)
 
@@ -28,10 +30,15 @@ Flux variants:
 Z-Image variant:
 - **Z-Image-Turbo** (`zimage-turbo`): distilled S3-DiT model, default 8 NFE (9 scheduler values), guidance 0.0.
 
+FLUX.3 variants (FLUX Kommunity License):
+- **Image Klein** (`flux-3-klein`): step-distilled flow map, 16 steps default (trained for 4..16), no CFG.
+- **Image Klein Base** (`flux-3-klein-base`): 50 steps, CFG 3.5.
+
 # High-Level Capabilities
 
 - Flux supports both txt2img and img2img with text conditioning.
 - Z-Image currently supports txt2img path in this codebase.
+- FLUX.3 currently supports txt2img (the transformer already accepts reference tokens).
 - Text embeddings are generated via Qwen3.
 - VAE is used for latent/image conversion in both families.
 
@@ -41,6 +48,7 @@ Z-Image variant:
 iris.c                    - Main library (model load, generation routing)
 iris_transformer_flux.c   - Flux diffusion transformer (MMDiT)
 iris_transformer_zimage.c - Z-Image transformer (S3-DiT)
+iris_transformer_flux3.c  - FLUX.3 transformer (per-mode + joint blocks)
 iris_sample.c             - Sampling/denoising loops (Euler ODE)
 iris_qwen3.c              - Qwen3 text encoder
 iris_qwen3_tokenizer.c    - BPE tokenizer
@@ -91,6 +99,10 @@ Z-Image example:
 
     ./iris -d zimage-turbo -p "a fish" -o /tmp/zimage.png
 
+FLUX.3 example:
+
+    ./iris -d flux-3-klein -p "a fish" -o /tmp/flux3.png
+
 If model weights are missing, use the download script only after user approval.
 
 # Python Reference Implementations
@@ -106,6 +118,12 @@ Z-Image references:
 - `flux_env/lib/python3.12/site-packages/diffusers/pipelines/z_image/pipeline_z_image.py`
 - `flux_env/lib/python3.12/site-packages/diffusers/schedulers/scheduling_flow_match_euler_discrete.py`
 - `flux_env/lib/python3.12/site-packages/diffusers/models/autoencoders/autoencoder_kl.py`
+
+FLUX.3 reference:
+- `debug/flux3_reference.py`: official pipeline (text encoding, Euler sampling,
+  VAE decode) on the official Flux3Transformer2DModel source, fetched from a
+  pinned diffusers commit (FLUX.3 is not in a diffusers release yet). Dumps
+  every intermediate tensor as raw float32; `--noise` starts from a C noise file.
 
 Rules:
 - Never add/commit `flux_env/` or `flux2/`.
@@ -369,6 +387,52 @@ Important points:
 5. **RMSNorm temporary weight caching pitfalls.**
    - Temporary fused norm weights must not be pointer-cached as immutable weights.
 
+# FLUX.3 Architecture (Image Klein)
+
+Transformer config (reference): dim=3072, heads=24, head_dim=128, mlp_ratio=3,
+num_layers=5 (per mode), num_single_layers=28, joint_attention_dim=20480,
+axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
+
+- Token modes: text, image, image_cond (references). Each mode first runs its
+  own 5 blocks (self-attention within the mode), then the 28 joint blocks run
+  over `[TEXT, IMAGE, REFS]`. Only image tokens reach the output layer.
+- All blocks are identical: LayerNorm (no affine) -> `(1 + scale) * n + shift`
+  -> attention and SwiGLU FFN in parallel on the same input ->
+  `x += gate * (attn + ffn)`. Separate to_q/to_k/to_v, QK RMSNorm with weights.
+- FFN linear_in output is `[gate | up]` halves: `silu(gate) * up`.
+- Modulation is per mode, not per block: one projection per mode for all
+  per-mode blocks and one for all joint blocks, split as (shift, scale, gate).
+  The output layer splits as (scale, shift). All projections have no bias.
+- Image tokens use timestep t, text and references timestep 0. Flow-map models
+  add the embedding of the target timestep (next sigma) to every mode.
+- RoPE: consecutive-pair rotation. Image (0, row/2, col/2, 0), text
+  (0, 0, 0, index), reference i (0, row/2, col/2, -(i+1)).
+- Scheduler: sigmas = linspace(1, 1/n, n), static shift 6.93, terminal 0.
+  Plain Euler: `x += (sigma_next - sigma) * v`.
+
+# FLUX.3 Text Encoder
+
+- Qwen3-VL-4B text model (tensors under `model.language_model.`), same shape
+  as Qwen3-4B, rope_theta=5e6. With text-only input its MRoPE is plain RoPE.
+- Chat template has NO `<think>` block.
+- Concatenate hidden_states[4, 8, ..., 32] -> [seq, 20480].
+- Pad (with `<|endoftext|>`) to the next multiple of 80 tokens. Padding is
+  masked inside Qwen3-VL but NOT in the transformer, and pad tokens sit at
+  RoPE position 1 (transformers 4.57 behavior, used for training).
+
+# FLUX.3 Known Pitfalls (Historical Bugs)
+
+1. **Tokenizer merges format**: the Qwen3-VL tokenizer.json stores merges as
+   `"a b"` strings, not `["a", "b"]` pairs; unparsed merges silently give
+   character-level tokens.
+2. **GPU attention threadgroup size**: the causal attention kernels use tree
+   reductions that need a power-of-two thread count. Flux/Z-Image always used
+   512 tokens; Flux3 windows (80, 160, ...) exposed the bug.
+3. **RoPE table buffer caching**: the text encoder refills its RoPE tables per
+   prompt, so they must not go through the pointer-keyed rope buffer cache.
+4. **Metal weight cache keys**: on MPS builds, Flux3 linears pass the mmapped
+   bf16 weight pointers; a reused f32 conversion scratch would be served stale.
+
 # Test Commands
 
 Basic verification:
@@ -385,6 +449,12 @@ Manual Flux sanity:
 Manual Z-Image sanity:
 ```bash
 ./iris -d zimage-turbo -p "a fish" --seed 43 --steps 8 -o /tmp/zimage_test.png
+```
+
+Manual FLUX.3 sanity:
+```bash
+./iris -d flux-3-klein -p "A fluffy orange cat sitting on a windowsill" \
+  --seed 42 --steps 4 -W 256 -H 256 -o /tmp/flux3_test.png
 ```
 
 # Flux Known Pitfalls (Historical Bugs)
