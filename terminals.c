@@ -56,6 +56,12 @@ term_graphics_proto detect_terminal_graphics(void) {
     if (getenv("KONSOLE_VERSION"))
         return TERM_PROTO_ITERM2;
 
+    /* Over SSH the variables above are not forwarded, but TERM is:
+     * xterm-kitty, xterm-ghostty. */
+    const char *term = getenv("TERM");
+    if (term && (strstr(term, "kitty") || strstr(term, "ghostty")))
+        return TERM_PROTO_KITTY;
+
     return TERM_PROTO_NONE;
 }
 
