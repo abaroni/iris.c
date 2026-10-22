@@ -97,11 +97,15 @@ void iris_dev_add_bias(float *y, const float *bias, int rows, int cols);  /* y[r
 
 /* Convolution layers on channels-last f32 images [h * w, channels]. */
 
-/* Stride 1 convolution with 'same' padding, k = 1 or 3:
- * out[p, o] = bias[o] + sum in[p + (ky - k/2, kx - k/2), c] * w[o, (ky * k + kx) * cin + c]
+/* k x k convolution of [h * width, cin] into [oh * ow, cout], with zero
+ * padding of pad_before / pad_after pixels on each axis:
+ *   oh = (h + pad_before + pad_after - k) / stride + 1 (same for ow)
+ *   out[(oy, ox), o] = bias[o] + sum_{ky, kx, c} w[o, (ky * k + kx) * cin + c] *
+ *                      in[(oy * stride + ky - pad_before, ox * stride + kx - pad_before), c]
  * w: bf16 [cout, k * k * cin]. bias may be NULL. */
 void iris_dev_conv2d(float *out, const float *in, const uint16_t *w, const float *bias,
-                     int h, int width, int cin, int cout, int k);
+                     int h, int width, int cin, int cout, int k, int stride,
+                     int pad_before, int pad_after);
 
 /* GroupNorm over [hw, c] (groups of c / groups channels) with affine
  * gamma/beta [c], optionally followed by SiLU. */

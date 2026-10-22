@@ -242,7 +242,7 @@ iris_image *iris_image_create(int width, int height, int channels);
 void iris_image_free(iris_image *img);
 
 /*
- * Resize image using bilinear interpolation.
+ * Resize image (Lanczos-3, antialiased when downscaling).
  */
 iris_image *iris_image_resize(const iris_image *img, int new_width, int new_height);
 

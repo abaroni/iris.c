@@ -948,49 +948,96 @@ int iris_image_save_with_seed(const iris_image *img, const char *path, int64_t s
  * Image Manipulation
  * ======================================================================== */
 
+/* Lanczos-3 resampling weights for one axis, the way PIL computes them: the
+ * filter support grows with the downscaling factor, so shrinking low-pass
+ * filters the image instead of aliasing. For output pixel i, the weights of
+ * input pixels start[i] .. start[i] + count[i] - 1 are w[i * ksize ...]. */
+#define LANCZOS_PI 3.14159265358979323846
+
+static float *lanczos_weights(int in_size, int out_size, int *ksize_out,
+                              int *start, int *count) {
+    double scale = (double)in_size / out_size;
+    double fscale = scale < 1.0 ? 1.0 : scale;
+    double support = 3.0 * fscale;
+    int ksize = (int)ceil(support) * 2 + 1;
+    float *w = calloc((size_t)out_size * ksize, sizeof(float));
+    if (!w) return NULL;
+
+    for (int i = 0; i < out_size; i++) {
+        double center = (i + 0.5) * scale;
+        int xmin = (int)(center - support + 0.5);
+        int xmax = (int)(center + support + 0.5);
+        if (xmin < 0) xmin = 0;
+        if (xmax > in_size) xmax = in_size;
+        if (xmax - xmin > ksize) xmax = xmin + ksize;
+        double sum = 0;
+        for (int x = xmin; x < xmax; x++) {
+            double t = (x - center + 0.5) / fscale;
+            double v = 0;
+            if (t == 0) v = 1;
+            else if (t > -3 && t < 3)
+                v = 3 * sin(LANCZOS_PI * t) * sin(LANCZOS_PI * t / 3) /
+                    (LANCZOS_PI * LANCZOS_PI * t * t);
+            w[(size_t)i * ksize + (x - xmin)] = (float)v;
+            sum += v;
+        }
+        if (sum != 0)
+            for (int k = 0; k < xmax - xmin; k++) w[(size_t)i * ksize + k] /= (float)sum;
+        start[i] = xmin;
+        count[i] = xmax - xmin;
+    }
+    *ksize_out = ksize;
+    return w;
+}
+
+/* Resize with Lanczos-3 (separable, antialiased when downscaling, as PIL's
+ * LANCZOS filter): horizontal pass into a float buffer, then vertical. */
 iris_image *iris_image_resize(const iris_image *img, int new_width, int new_height) {
     if (!img || new_width <= 0 || new_height <= 0) return NULL;
 
-    iris_image *resized = iris_image_create(new_width, new_height, img->channels);
-    if (!resized) return NULL;
+    int ch = img->channels;
+    int kx, ky;
+    int *xs = malloc(new_width * sizeof(int)), *xc = malloc(new_width * sizeof(int));
+    int *ys = malloc(new_height * sizeof(int)), *yc = malloc(new_height * sizeof(int));
+    float *wx = (xs && xc) ? lanczos_weights(img->width, new_width, &kx, xs, xc) : NULL;
+    float *wy = (ys && yc) ? lanczos_weights(img->height, new_height, &ky, ys, yc) : NULL;
+    float *tmp = malloc((size_t)img->height * new_width * ch * sizeof(float));
+    iris_image *resized = iris_image_create(new_width, new_height, ch);
+    if (!wx || !wy || !tmp || !resized) {
+        iris_image_free(resized);
+        resized = NULL;
+        goto done;
+    }
 
-    float scale_x = (float)img->width / new_width;
-    float scale_y = (float)img->height / new_height;
-
-    for (int y = 0; y < new_height; y++) {
+    for (int y = 0; y < img->height; y++) {
+        const uint8_t *row = img->data + (size_t)y * img->width * ch;
         for (int x = 0; x < new_width; x++) {
-            float src_x = (x + 0.5f) * scale_x - 0.5f;
-            float src_y = (y + 0.5f) * scale_y - 0.5f;
-
-            int x0 = (int)floorf(src_x);
-            int y0 = (int)floorf(src_y);
-            int x1 = x0 + 1;
-            int y1 = y0 + 1;
-
-            float wx = src_x - x0;
-            float wy = src_y - y0;
-
-            x0 = (x0 < 0) ? 0 : (x0 >= img->width) ? img->width - 1 : x0;
-            x1 = (x1 < 0) ? 0 : (x1 >= img->width) ? img->width - 1 : x1;
-            y0 = (y0 < 0) ? 0 : (y0 >= img->height) ? img->height - 1 : y0;
-            y1 = (y1 < 0) ? 0 : (y1 >= img->height) ? img->height - 1 : y1;
-
-            for (int c = 0; c < img->channels; c++) {
-                float v00 = img->data[(y0 * img->width + x0) * img->channels + c];
-                float v01 = img->data[(y0 * img->width + x1) * img->channels + c];
-                float v10 = img->data[(y1 * img->width + x0) * img->channels + c];
-                float v11 = img->data[(y1 * img->width + x1) * img->channels + c];
-
-                float v = v00 * (1 - wx) * (1 - wy) +
-                          v01 * wx * (1 - wy) +
-                          v10 * (1 - wx) * wy +
-                          v11 * wx * wy;
-
-                resized->data[(y * new_width + x) * img->channels + c] = (uint8_t)(v + 0.5f);
+            const float *w = wx + (size_t)x * kx;
+            for (int c = 0; c < ch; c++) {
+                float v = 0;
+                for (int k = 0; k < xc[x]; k++) v += w[k] * row[(xs[x] + k) * ch + c];
+                tmp[((size_t)y * new_width + x) * ch + c] = v;
             }
         }
     }
+    for (int y = 0; y < new_height; y++) {
+        const float *w = wy + (size_t)y * ky;
+        for (int x = 0; x < new_width * ch; x++) {
+            float v = 0;
+            for (int k = 0; k < yc[y]; k++) v += w[k] * tmp[(size_t)(ys[y] + k) * new_width * ch + x];
+            v = v < 0 ? 0 : v > 255 ? 255 : v;
+            resized->data[(size_t)y * new_width * ch + x] = (uint8_t)(v + 0.5f);
+        }
+    }
 
+done:
+    free(xs);
+    free(xc);
+    free(ys);
+    free(yc);
+    free(wx);
+    free(wy);
+    free(tmp);
     return resized;
 }
 

@@ -81,19 +81,33 @@ ZIMAGE_SMOKE_TEST = {
 }
 
 
-# Optional FLUX.3 test, run only if a FLUX.3 model directory is found.
-# The reference was produced by debug/flux3_reference.py (official diffusers
-# pipeline, float32) starting from the noise iris generates for seed 42.
-FLUX3_TEST = {
-    "name": "FLUX.3 Klein test (4 steps, 256x256)",
-    "prompt": "A fluffy orange cat sitting on a windowsill",
-    "seed": 42,
-    "steps": 4,
-    "width": 256,
-    "height": 256,
-    "reference": "test_vectors/reference_flux3_4step_256x256_seed42.png",
-    "mean_diff_threshold": 20,
-}
+# Optional FLUX.3 tests, run only if a FLUX.3 model directory is found.
+# The references were produced by debug/flux3_reference.py (official
+# diffusers pipeline, float32) starting from the noise iris generates for
+# seed 42.
+FLUX3_TESTS = [
+    {
+        "name": "FLUX.3 Klein test (4 steps, 256x256)",
+        "prompt": "A fluffy orange cat sitting on a windowsill",
+        "seed": 42,
+        "steps": 4,
+        "width": 256,
+        "height": 256,
+        "reference": "test_vectors/reference_flux3_4step_256x256_seed42.png",
+        "mean_diff_threshold": 20,
+    },
+    {
+        "name": "FLUX.3 Klein edit test (4 steps, 256x256)",
+        "prompt": "Turn the cat into a watercolor painting",
+        "seed": 42,
+        "steps": 4,
+        "width": 256,
+        "height": 256,
+        "input": "test_vectors/img2img_input_256x256.png",
+        "reference": "test_vectors/reference_flux3_edit_4step_256x256_seed42.png",
+        "mean_diff_threshold": 20,
+    },
+]
 
 
 def is_flux3_model_dir(model_dir: Path) -> bool:
@@ -235,18 +249,18 @@ def main():
     # Optional Z-Image and FLUX.3 coverage: run only in non-quick mode.
     scheduled_tests: list[tuple[dict, str]] = [(t, args.model_dir) for t in tests_to_run]
     optional = [
-        ("Z-Image", "--zimage-model-dir", args.zimage_model_dir, ZIMAGE_SMOKE_TEST,
+        ("Z-Image", "--zimage-model-dir", args.zimage_model_dir, [ZIMAGE_SMOKE_TEST],
          ("zimage-turbo", "zimage", "Z-Image-Turbo"), is_zimage_model_dir),
-        ("FLUX.3", "--flux3-model-dir", args.flux3_model_dir, FLUX3_TEST,
+        ("FLUX.3", "--flux3-model-dir", args.flux3_model_dir, FLUX3_TESTS,
          ("flux-3-klein", "flux-3-klein-base"), is_flux3_model_dir),
     ]
-    for label, flag, explicit, test, names, matches in optional:
+    for label, flag, explicit, tests, names, matches in optional:
         if args.quick:
             break
         model_dir = detect_model_dir(explicit, names, matches)
         if model_dir:
             print(f"Detected {label} model dir: {model_dir}")
-            scheduled_tests.append((test, str(model_dir)))
+            scheduled_tests.extend((test, str(model_dir)) for test in tests)
         elif explicit:
             print(f"Warning: {flag} '{explicit}' is not a valid {label} model dir")
             print(f"Skipping optional {label} test.")

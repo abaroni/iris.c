@@ -38,7 +38,10 @@ FLUX.3 variants (FLUX Kommunity License):
 
 - Flux supports both txt2img and img2img with text conditioning.
 - Z-Image currently supports txt2img path in this codebase.
-- FLUX.3 currently supports txt2img (the transformer already accepts reference tokens).
+- FLUX.3 supports txt2img and reference images (editing, multi-reference). References
+  are prepared like the official image processor: one reference is kept whole
+  (downscaled so its 16-px canvas fits 4 MP, reflect-padded, output cropped back),
+  several are downscaled under 1 MP and center-cropped. Side cap: IRIS_VAE_MAX_DIM.
 - Text embeddings are generated via Qwen3.
 - VAE is used for latent/image conversion in both families.
 

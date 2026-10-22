@@ -26,6 +26,8 @@ Outputs in the -o directory:
     image.png             decoded image
 
 Pass --noise FILE to start from a noise file (e.g. one dumped by C).
+--ref IMAGE (repeatable) conditions on reference images, prepared like the
+official Flux3ImageProcessor; ref<i>.bin holds their normalized latents.
 """
 
 import argparse
@@ -117,6 +119,44 @@ def text_ids(seq):
                                 torch.arange(seq)).to(torch.float32)
 
 
+def prepare_references(paths):
+    """Official preprocessing: one reference is downscaled so that its canvas
+    (size rounded up to 16) fits under 4 MP and reflect-padded to it, several
+    are downscaled under 1 MP and center-cropped to multiples of 16. Returns
+    tensors in [-1, 1] and the crop box of a single padded reference."""
+    from PIL import Image
+    images = [Image.open(p).convert("RGB") for p in paths]
+    canvas = lambda side: min(4096, max(64, -(-side // 16) * 16))
+    out, crop = [], None
+    for img in images:
+        w, h = img.size
+        if len(images) == 1:
+            scale = min(1.0, math.sqrt(4 * 1024 * 1024 / (w * h)), 4096 / max(w, h))
+            while True:
+                nh, nw = (max(1, round(side * scale)) for side in (h, w))
+                if canvas(nh) * canvas(nw) <= 4 * 1024 * 1024:
+                    break
+                scale *= 0.995
+            if (nw, nh) != (w, h):
+                img = img.resize((nw, nh), Image.LANCZOS)
+            ch, cw = canvas(nh), canvas(nw)
+            left, top = (cw - nw) // 2, (ch - nh) // 2
+            mode = "reflect" if min(nw, nh) > 16 else "symmetric"
+            arr = np.pad(np.asarray(img), ((top, ch - nh - top), (left, cw - nw - left), (0, 0)), mode=mode)
+            crop = (left, top, left + nw, top + nh)
+        else:
+            if w * h > 1024 * 1024:
+                scale = math.sqrt(1024 * 1024 / (w * h))
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            nw, nh = img.size
+            cw, ch = nw - nw % 16, nh - nh % 16
+            left, top = (nw - cw) // 2, (nh - ch) // 2
+            arr = np.asarray(img)[top:top + ch, left:left + cw]
+        t = torch.from_numpy(arr.astype(np.float32) / 127.5 - 1.0).permute(2, 0, 1)[None]
+        out.append(t)
+    return out, crop
+
+
 def sigma_schedule(num_steps, shift=6.93):
     s = np.linspace(1.0, 1.0 / num_steps, num_steps)
     s = shift * s / (1 + (shift - 1) * s)
@@ -127,8 +167,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-d", "--model-dir", required=True)
     ap.add_argument("-p", "--prompt", required=True)
-    ap.add_argument("-W", "--width", type=int, default=256)
-    ap.add_argument("-H", "--height", type=int, default=256)
+    ap.add_argument("-W", "--width", type=int, default=None, help="default: 256, or the reference size")
+    ap.add_argument("-H", "--height", type=int, default=None)
+    ap.add_argument("--ref", action="append", default=[], help="reference image (repeatable)")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("-g", "--guidance", type=float, default=3.5, help="CFG scale (base model only)")
@@ -158,7 +199,32 @@ def main():
     if args.text_only:
         return
 
-    # 2. Latents and ids
+    # 2. Reference images: VAE encode, patchify, batch norm, ids
+    from diffusers.models import AutoencoderKLFlux2
+    vae = AutoencoderKLFlux2.from_pretrained(os.path.join(args.model_dir, "vae"), torch_dtype=torch.float32)
+    bn_mean = vae.bn.running_mean.view(1, -1, 1, 1)
+    bn_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps)
+    cond_tokens, cond_ids, crop = [], [], None
+    size_given = args.width is not None
+    if args.ref:
+        ref_images, crop = prepare_references(args.ref)
+        for i, img in enumerate(ref_images):
+            lat = vae.encode(img).latent_dist.mode()
+            b, c, lh2, lw2 = lat.shape
+            lat = lat.view(b, c, lh2 // 2, 2, lw2 // 2, 2).permute(0, 1, 3, 5, 2, 4).reshape(b, c * 4, lh2 // 2, lw2 // 2)
+            lat = (lat - bn_mean) / bn_std
+            dump(out(f"ref{i}.bin"), lat[0])
+            cond_tokens.append(lat.flatten(2).transpose(1, 2))
+            cond_ids.append(image_ids(lat.shape[2], lat.shape[3], l_coord=-(1 + i)))
+            if i == 0 and not size_given:
+                args.height, args.width = lat.shape[2] * 16, lat.shape[3] * 16
+        print(f"references: {[tuple(t.shape) for t in cond_tokens]}")
+    if size_given:
+        crop = None
+    args.width = args.width or 256
+    args.height = args.height or 256
+
+    # 3. Latents and ids
     h, w = args.height // 16, args.width // 16
     if args.noise:
         noise = torch.from_numpy(np.fromfile(args.noise, dtype=np.float32)).view(1, 128, h, w)
@@ -173,13 +239,16 @@ def main():
     sigmas = sigma_schedule(steps)
     np.savetxt(out("sigmas.txt"), sigmas, fmt="%.8f")
 
-    # 3. Denoise
+    # 4. Denoise
     cls = load_flux3_class(os.path.join(args.out_dir, "transformer_flux3.py"))
     model = cls.from_pretrained(os.path.join(args.model_dir, "transformer"), torch_dtype=dtype).eval()
     for i in range(steps):
         t = torch.tensor([sigmas[i]], dtype=dtype)
         tn = torch.tensor([sigmas[i + 1]], dtype=dtype)
         kw = dict(hidden_states=x, timestep=t, img_ids=img_ids, return_dict=False)
+        if cond_tokens:
+            kw["image_cond_hidden_states"] = torch.cat(cond_tokens, dim=1).to(dtype)
+            kw["image_cond_ids"] = torch.cat(cond_ids, dim=0)
         if flow_map:
             v = model(encoder_hidden_states=emb.to(dtype), txt_ids=text_ids(emb.shape[1]),
                       target_timestep=tn, **kw)[0]
@@ -193,17 +262,16 @@ def main():
         print(f"step {i + 1}/{steps} sigma {sigmas[i]:.5f} -> {sigmas[i + 1]:.5f}")
     del model
 
-    # 4. Decode
-    from diffusers.models import AutoencoderKLFlux2
-    vae = AutoencoderKLFlux2.from_pretrained(os.path.join(args.model_dir, "vae"), torch_dtype=torch.float32)
+    # 5. Decode (a single padded reference: crop back to the image)
     lat = x.float().transpose(1, 2).reshape(1, 128, h, w)
     dump(out("latent.bin"), lat[0])
-    mean = vae.bn.running_mean.view(1, -1, 1, 1)
-    std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps)
-    lat = lat * std + mean
+    lat = lat * bn_std + bn_mean
     lat = lat.reshape(1, 32, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(1, 32, h * 2, w * 2)
     img = vae.decode(lat, return_dict=False)[0]
     img = ((img[0].clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8).permute(1, 2, 0).numpy()
+    if crop is not None:
+        left, top, right, bottom = crop
+        img = img[top:bottom, left:right]
     from PIL import Image
     Image.fromarray(img).save(out("image.png"))
     print(f"wrote {out('image.png')}")

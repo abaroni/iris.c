@@ -862,25 +862,28 @@ extern "C" void iris_dev_add_bias(float *y, const float *bias, int rows, int col
     if (n) k_add_bias<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(y, bias, cols, n);
 }
 
-/* Columns for pixels [p0, p0 + np): row p holds the k x k neighborhood,
- * (ky, kx, c) order, zero outside the image. */
-__global__ void k_im2col(uint16_t *cols, const float *in, int h, int w, int cin,
-                         int k, int p0, size_t n) {
+/* Columns for output pixels [p0, p0 + np): row p holds the k x k
+ * neighborhood, (ky, kx, c) order, zero outside the image. */
+__global__ void k_im2col(uint16_t *cols, const float *in, int h, int w, int cin, int k,
+                         int stride, int pad, int ow, int p0, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     int row_len = k * k * cin;
     int p = p0 + (int)(i / row_len);
     int r = (int)(i % row_len);
     int tap = r / cin, c = r % cin;
-    int y = p / w + tap / k - k / 2;
-    int x = p % w + tap % k - k / 2;
+    int y = (p / ow) * stride + tap / k - pad;
+    int x = (p % ow) * stride + tap % k - pad;
     float v = (y >= 0 && y < h && x >= 0 && x < w) ? in[((size_t)y * w + x) * cin + c] : 0.0f;
     cols[i] = f2bf(v);
 }
 
 extern "C" void iris_dev_conv2d(float *out, const float *in, const uint16_t *w, const float *bias,
-                                int h, int width, int cin, int cout, int k) {
-    int hw = h * width;
+                                int h, int width, int cin, int cout, int k, int stride,
+                                int pad_before, int pad_after) {
+    int oh = (h + pad_before + pad_after - k) / stride + 1;
+    int ow = (width + pad_before + pad_after - k) / stride + 1;
+    int ohw = oh * ow;
     int row_len = k * k * cin;
     if (!g_conv_scratch) g_conv_scratch = (uint16_t *)iris_dev_alloc(CONV_SCRATCH);
     if (!g_conv_scratch) {
@@ -888,15 +891,15 @@ extern "C" void iris_dev_conv2d(float *out, const float *in, const uint16_t *w, 
         return;
     }
     int chunk = (int)(CONV_SCRATCH / ((size_t)row_len * sizeof(uint16_t)));
-    if (chunk > hw) chunk = hw;
-    for (int p0 = 0; p0 < hw; p0 += chunk) {
-        int np = hw - p0 < chunk ? hw - p0 : chunk;
+    if (chunk > ohw) chunk = ohw;
+    for (int p0 = 0; p0 < ohw; p0 += chunk) {
+        int np = ohw - p0 < chunk ? ohw - p0 : chunk;
         size_t n = (size_t)np * row_len;
-        k_im2col<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(g_conv_scratch, in, h, width,
-                                                            cin, k, p0, n);
+        k_im2col<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(g_conv_scratch, in, h, width, cin, k,
+                                                            stride, pad_before, ow, p0, n);
         linear(out + (size_t)p0 * cout, BLAS_R_32F, g_conv_scratch, w, np, row_len, cout);
     }
-    if (bias) iris_dev_add_bias(out, bias, hw, cout);
+    if (bias) iris_dev_add_bias(out, bias, ohw, cout);
 }
 
 /* GroupNorm statistics, two passes: partial sums of x (pass 0) or of

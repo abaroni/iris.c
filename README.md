@@ -16,7 +16,7 @@ Supported model families:
 - **[FLUX.3 Image Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein)** (by [Black Forest Labs](https://bfl.ai/)):
   - **5.6B distilled** (16 steps by default, trained for 4 to 16, no CFG. FLUX Kommunity License).
   - **5.6B base** (50 steps, CFG. FLUX Kommunity License).
-  - Text-to-image only for now (reference images are not supported yet).
+  - Text-to-image, editing (`-i image`) and multi-reference generation (`-i` repeated).
   - Runs fully on the GPU with the CUDA (NVIDIA) and ROCm (AMD) backends.
 
 ## Quick Start

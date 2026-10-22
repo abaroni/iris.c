@@ -582,9 +582,8 @@ int main(int argc, char *argv[]) {
                         i + 1, inputs[i]->width, inputs[i]->height, inputs[i]->channels);
         }
 
-        /* Use first input image dimensions if not explicitly set */
-        if (!width_set) params.width = inputs[0]->width;
-        if (!height_set) params.height = inputs[0]->height;
+        /* Without an explicit size the library uses the first reference's */
+        if (!width_set || !height_set) params.width = params.height = 0;
 
         /* Generate with multi-reference */
         output = iris_multiref(ctx, prompt, (const iris_image **)inputs, num_inputs, &params);
