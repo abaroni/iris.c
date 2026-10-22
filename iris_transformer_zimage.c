@@ -710,9 +710,11 @@ static void zi_attention(float *out, const float *x,
     zi_apply_rope(q, pos_ids, seq, n_heads, tf);
     zi_apply_rope(k, pos_ids, seq, n_heads, tf);
 
-    /* Scaled dot-product attention per head */
+    /* Scaled dot-product attention per head. The output of a head overwrites
+     * its queries, no longer needed once the scores are computed: out is
+     * work_tmp in the callers, so it must not hold the projection input. */
     float scale = 1.0f / sqrtf((float)head_dim);
-    float *attn_out = tf->work_tmp;
+    float *attn_out = q;
 
     for (int h = 0; h < n_heads; h++) {
         float *scores = tf->work_attn;
