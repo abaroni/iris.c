@@ -17,7 +17,7 @@ Supported model families:
   - **5.6B distilled** (16 steps by default, trained for 4 to 16, no CFG. FLUX Kommunity License).
   - **5.6B base** (50 steps, CFG. FLUX Kommunity License).
   - Text-to-image, editing (`-i image`) and multi-reference generation (`-i` repeated).
-  - Runs fully on the GPU with the CUDA (NVIDIA) and ROCm (AMD) backends.
+  - Runs fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
 
 ## Quick Start
 
@@ -418,16 +418,16 @@ The MPS implementation is faster than the PyTorch optimized pipeline at all reso
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 - The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14.23 seconds (in the same hardware), however it is worth noting that it uses 6-bit quantized weights, while this implementation uses the official BF16 weights. The 6-bit quantization used by Draw Things provides both a big memory win and a moderate speed advantage (not nearly as much as it could in an LLM, where causal attention is dominated by memory bandwidth); if we account for this, the performance is comparable.
 
-### FLUX.3 on CUDA and ROCm
+### FLUX.3 on the GPU
 
 FLUX.3 Image Klein distilled, default 16 steps, wall clock including model
 loading:
 
-| Size | NVIDIA GB10 (CUDA) | AMD Strix Halo, Radeon 8060S (ROCm) |
-|------|--------------------|--------------------------------------|
-| 256x256 | 4.3s | 5.7s |
-| 512x512 | 5.6s | 11.8s |
-| 1024x1024 | 13.8s | 39.4s |
+| Size | Apple M5 Max (MPS) | NVIDIA GB10 (CUDA) | AMD Strix Halo, Radeon 8060S (ROCm) |
+|------|--------------------|--------------------|--------------------------------------|
+| 256x256 | 3.4s | 4.3s | 5.7s |
+| 512x512 | 5.3s | 5.6s | 11.8s |
+| 1024x1024 | 16.2s | 13.8s | 39.4s |
 
 ### Community Benchmarks
 

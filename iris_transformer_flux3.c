@@ -425,7 +425,7 @@ static void latent_to_tokens(float *tokens, const float *latent, int ch, int n) 
 
 #ifdef IRIS_DEV
 /* ========================================================================
- * GPU Forward (CUDA / ROCm)
+ * GPU Forward (CUDA / ROCm / Metal)
  * ======================================================================== */
 
 /* Device copy of a block. The projections are fused into two GEMMs:

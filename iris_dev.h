@@ -2,7 +2,8 @@
  * Iris device (GPU) compute API
  *
  * A small set of operations for GPU-resident inference, implemented by
- * iris_cuda.cu for NVIDIA GPUs (CUDA) and AMD GPUs (ROCm/HIP, same source).
+ * iris_cuda.cu for NVIDIA GPUs (CUDA) and AMD GPUs (ROCm/HIP, same source),
+ * and by iris_dev_metal.m for Apple GPUs.
  *
  * - Tensors are plain device pointers from iris_dev_alloc(); bf16 values
  *   are stored as uint16_t, matrices are row-major.

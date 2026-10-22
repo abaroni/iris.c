@@ -17,7 +17,9 @@
 #ifdef USE_METAL
 #include "iris_metal.h"
 #endif
-#ifdef IRIS_DEV
+/* CUDA / ROCm device backend (Metal builds keep the native Metal VAE) */
+#if defined(IRIS_DEV) && !defined(USE_METAL)
+#define VAE_DEV
 #include "iris_dev.h"
 #endif
 #include <stdio.h>
@@ -128,7 +130,7 @@ typedef struct iris_vae {
 
 /* Forward declarations */
 void iris_vae_free(iris_vae_t *vae);
-#ifdef IRIS_DEV
+#ifdef VAE_DEV
 static float *vae_encode_dev(iris_vae_t *vae, const float *img, int H, int W,
                              int *out_h, int *out_w);
 #endif
@@ -397,7 +399,7 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
      * -> batch_norm
      */
 
-#ifdef IRIS_DEV
+#ifdef VAE_DEV
     if (iris_dev_available() && batch == 1) {
         float *latent = vae_encode_dev(vae, img, H, W, out_h, out_w);
         if (latent) return latent;
@@ -787,7 +789,7 @@ static void vae_prepare_latent(iris_vae_t *vae, float *out, float *tmp, const fl
     iris_unpatchify(out, tmp, batch, vae->z_channels, latent_h, latent_w, 2);
 }
 
-#ifdef IRIS_DEV
+#ifdef VAE_DEV
 /* ========================================================================
  * GPU Decoder (CUDA / ROCm)
  *
@@ -1321,7 +1323,7 @@ static float *vae_encode_dev(iris_vae_t *vae, const float *img, int H, int W,
     free(moments);
     return latent;
 }
-#endif /* IRIS_DEV */
+#endif /* VAE_DEV */
 
 iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
                             int batch, int latent_h, int latent_w) {
@@ -1333,7 +1335,7 @@ iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
         /* Fall through to CPU path on failure */
     }
 #endif
-#ifdef IRIS_DEV
+#ifdef VAE_DEV
     if (iris_dev_available() && batch == 1) {
         iris_image *gpu_result = vae_decode_dev(vae, latent, latent_h, latent_w);
         if (gpu_result) return gpu_result;
@@ -1730,7 +1732,7 @@ void iris_vae_free(iris_vae_t *vae) {
     free(vae->work2);
     free(vae->work3);
 
-#ifdef IRIS_DEV
+#ifdef VAE_DEV
     vdev_free(vae);
 #endif
     free(vae);

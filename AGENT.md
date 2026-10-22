@@ -59,8 +59,9 @@ iris_vae.c                - VAE encoder/decoder
 iris_kernels.c            - CPU kernels (softmax, RMSNorm, etc.)
 iris_metal.m              - Metal GPU acceleration runtime
 iris_metal.h              - Metal/GPU API surface
-iris_dev.h                - Device (CUDA / ROCm) compute API
+iris_dev.h                - Device (CUDA / ROCm / Metal) compute API
 iris_cuda.cu              - CUDA / ROCm (HIP) implementation of iris_dev.h
+iris_dev_metal.m          - Metal implementation of iris_dev.h
 iris_shaders.metal        - Metal compute kernels
 iris_safetensors.c        - Weight loading
 iris_image.c              - Image I/O (PNG/PPM/JPEG)
@@ -76,7 +77,8 @@ main.c                    - CLI entry point
 # Build Targets
 
 This project implements five targets:
-- MPS: Apple Silicon GPU path.
+- MPS: Apple Silicon GPU path. FLUX.3's transformer uses iris_dev.h
+  (iris_dev_metal.m); the rest uses iris_metal.m.
 - CUDA / ROCm: NVIDIA / AMD GPU path (iris_dev.h, implemented by iris_cuda.cu,
   one source for nvcc and hipcc). Currently FLUX.3 transformer, Qwen3 text
   encoder and VAE decoder; FLUX.2 / Z-Image transformers run on the CPU there.
@@ -442,7 +444,7 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
 4. **Metal weight cache keys**: on MPS builds, Flux3 linears pass the mmapped
    bf16 weight pointers; a reused f32 conversion scratch would be served stale.
 
-# CUDA / ROCm Backend
+# Device Backend (CUDA / ROCm / Metal)
 
 - iris_dev.h is a small API for GPU-resident inference: plain device pointers,
   bf16 stored as uint16_t, one stream (iris_dev_download()/sync() wait).
@@ -456,6 +458,12 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
   cp.async + ldmatrix; ROCm: gfx11 WMMA, computing transposed products so each
   lane owns a query). Other cases use batched GEMMs around a softmax.
 - Uploads: CUDA goes through pinned staging buffers.
+- Metal (iris_dev_metal.m): device pointers are the CPU addresses of shared
+  MTLBuffers, mapped back to (buffer, offset) by a sorted allocation table.
+  Work goes into one command buffer, committed by sync/download/upload/free.
+  GEMMs and attention use MPSGraph (bf16 matmul, fused SDPA on contiguous
+  copies of q/k/v). In MPS builds only FLUX.3's transformer uses it: the
+  Qwen3 and VAE device paths are compiled out (QWEN3_DEV / VAE_DEV).
 
 Known pitfalls:
 1. rocBLAS has only fallback (slow) bf16 -> f32 GEMM kernels on gfx1151:

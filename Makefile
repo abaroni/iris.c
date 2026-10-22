@@ -108,7 +108,7 @@ iris_cuda.o: iris_cuda.cu iris_dev.h
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
-MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DACCELERATE_NEW_LAPACK
+MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DIRIS_DEV -DACCELERATE_NEW_LAPACK
 MPS_OBJCFLAGS = $(MPS_CFLAGS) -fobjc-arc
 MPS_LDFLAGS = $(LDFLAGS) -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Foundation
 
@@ -116,7 +116,7 @@ mps: clean mps-build
 	@echo ""
 	@echo "Built with MPS backend (Metal GPU acceleration)"
 
-mps-build: $(SRCS:.c=.mps.o) $(CLI_SRCS:.c=.mps.o) iris_metal.o main.mps.o
+mps-build: $(SRCS:.c=.mps.o) $(CLI_SRCS:.c=.mps.o) iris_metal.o iris_dev_metal.o main.mps.o
 	$(CC) $(MPS_CFLAGS) -o $(TARGET) $^ $(MPS_LDFLAGS)
 
 %.mps.o: %.c iris.h iris_kernels.h
@@ -127,6 +127,9 @@ iris_shaders_source.h: iris_shaders.metal
 	xxd -i $< > $@
 
 iris_metal.o: iris_metal.m iris_metal.h iris_shaders_source.h
+	$(CC) $(MPS_OBJCFLAGS) -c -o $@ $<
+
+iris_dev_metal.o: iris_dev_metal.m iris_dev.h
 	$(CC) $(MPS_OBJCFLAGS) -c -o $@ $<
 
 else
@@ -186,7 +189,7 @@ install: $(TARGET) $(LIB)
 	install -m 644 iris_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o iris_cuda.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o iris_dev_metal.o iris_cuda.o main.o $(TARGET) $(LIB)
 	rm -f iris_shaders_source.h
 
 info:

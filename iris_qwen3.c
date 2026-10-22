@@ -31,8 +31,9 @@
 #include "iris_metal.h"
 #endif
 
-/* CUDA / ROCm device backend */
-#ifdef IRIS_DEV
+/* CUDA / ROCm device backend (Metal builds keep the native Metal Qwen3 encoder) */
+#if defined(IRIS_DEV) && !defined(USE_METAL)
+#define QWEN3_DEV
 #include "iris_dev.h"
 #endif
 
@@ -156,7 +157,7 @@ static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **fi
                                    int num_files, const char *prefix, int layer_idx);
 #endif
 static void free_layer_weights(qwen3_layer_t *layer);
-#ifdef IRIS_DEV
+#ifdef QWEN3_DEV
 static int qwen3_forward_dev(qwen3_model_t *model, int seq_len, const int *attention_mask,
                              const int *out_layers, int num_out);
 static void qwen3_dev_free(qwen3_model_t *model);
@@ -1124,7 +1125,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     }
 
     /* Run through transformer layers */
-#ifdef IRIS_DEV
+#ifdef QWEN3_DEV
     /* CUDA / ROCm: whole forward pass on the GPU, weights from the mmap */
     if (iris_dev_available() && model->use_mmap &&
         qwen3_forward_dev(model, seq_len, attention_mask, out_layers, num_out))
@@ -1202,7 +1203,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
 #endif
 
     /* Build output embeddings */
-#if defined(USE_METAL) || defined(IRIS_DEV)
+#if defined(USE_METAL) || defined(QWEN3_DEV)
 concatenate: (void)0; /* label needs a statement; can't precede a declaration in C */
 #endif
     int text_dim = num_out * hidden;
@@ -1237,7 +1238,7 @@ static float *load_tensor(safetensors_file_t **files, int num_files, const char 
     return NULL;
 }
 
-#if defined(USE_METAL) || defined(IRIS_DEV)
+#if defined(USE_METAL) || defined(QWEN3_DEV)
 /* Helper to load bf16 tensor directly (zero-copy from mmap region) */
 static uint16_t *load_tensor_bf16(safetensors_file_t **files, int num_files, const char *name) {
     for (int f = 0; f < num_files; f++) {
@@ -1395,7 +1396,7 @@ static void free_layer_weights(qwen3_layer_t *layer) {
     memset(layer, 0, sizeof(*layer));
 }
 
-#ifdef IRIS_DEV
+#ifdef QWEN3_DEV
 /* ========================================================================
  * GPU Forward (CUDA / ROCm)
  * ======================================================================== */
@@ -1612,7 +1613,7 @@ static int qwen3_forward_dev(qwen3_model_t *model, int seq_len, const int *atten
     }
     return 1;
 }
-#endif /* IRIS_DEV */
+#endif /* QWEN3_DEV */
 
 
 /* Parse text_encoder/config.json to get architecture dimensions.
@@ -1999,7 +2000,7 @@ void qwen3_model_free(qwen3_model_t *model) {
         free(model->layer_outputs[i]);
     }
 
-#ifdef IRIS_DEV
+#ifdef QWEN3_DEV
     qwen3_dev_free(model);
 #endif
 
@@ -2033,7 +2034,7 @@ qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap) {
     }
 
     /* Load model - use mmap mode if requested (saves ~14GB RAM) */
-#ifdef IRIS_DEV
+#ifdef QWEN3_DEV
     /* The GPU path uploads the bf16 weights straight from the mapped files. */
     if (iris_dev_available()) use_mmap = 1;
 #endif
