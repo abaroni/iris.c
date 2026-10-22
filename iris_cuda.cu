@@ -18,6 +18,7 @@
 #include <hipblas/hipblas.h>
 #define GPU(name) hip##name
 typedef hipblasHandle_t blas_handle_t;
+typedef hipblasStatus_t blas_status_t;
 typedef hipDataType blas_dtype_t;
 typedef hipDeviceProp_t dev_prop_t;
 #define BLAS_OP_N HIPBLAS_OP_N
@@ -37,6 +38,7 @@ typedef hipDeviceProp_t dev_prop_t;
 #include <cublas_v2.h>
 #define GPU(name) cuda##name
 typedef cublasHandle_t blas_handle_t;
+typedef cublasStatus_t blas_status_t;
 typedef cudaDataType_t blas_dtype_t;
 typedef cudaDeviceProp dev_prop_t;
 #define BLAS_OP_N CUBLAS_OP_N
@@ -61,14 +63,11 @@ typedef cudaDeviceProp dev_prop_t;
 #define STAGE_BYTES ((size_t)64 << 20)   /* Pinned upload staging buffer (CUDA, each of 2) */
 
 /* Flash attention tiling */
-#define FA_BR 64                         /* queries per block */
+#define FA_BR 128                        /* queries per block (16 per wave / warp) */
+#define FA_THREADS (FA_BR * 2)
 #define FA_BC 64                         /* keys per tile */
 #define FA_D 128                         /* head dim */
-#ifdef IRIS_HIP
-#define FA_PAD 16                        /* shared row padding (bf16): 32-byte aligned rows */
-#else
 #define FA_PAD 8                         /* shared row padding (bf16): no bank conflicts */
-#endif
 #define FA_STRIDE (FA_D + FA_PAD)        /* shared row stride (bf16) */
 #define FA_SMEM (4 * FA_BC * FA_STRIDE * 2)  /* CUDA: 2 stages of K and V tiles */
 
@@ -274,9 +273,13 @@ __global__ void k_f32_to_bf16(uint16_t *dst, const float *src, size_t n) {
     if (i < n) dst[i] = f2bf(src[i]);
 }
 
-__global__ void k_bf16_to_f32(float *dst, const uint16_t *src, size_t n) {
+/* dst[i] = sum of the bf16 partial results src[p * n + i], p < parts. */
+__global__ void k_sum_bf16(float *dst, const uint16_t *src, int parts, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = bf2f(src[i]);
+    if (i >= n) return;
+    float s = 0.0f;
+    for (int p = 0; p < parts; p++) s += bf2f(src[p * n + i]);
+    dst[i] = s;
 }
 
 __global__ void k_silu(float *x, size_t n) {
@@ -414,13 +417,22 @@ extern "C" void iris_dev_head_norm_rope(uint16_t *x, int ld, const float *w,
  * ======================================================================== */
 
 /* Row-major y[rows, out] = x[rows, in] @ W[out, in]^T, i.e. column-major
- * y^T = W^T(T) * x^T. */
+ * y^T = W^T(T) * x^T. With split > 1, slice p of the reduction (columns
+ * [p * in / split, (p + 1) * in / split) of x and W) goes to the partial
+ * result y + p * rows * out. */
 static void linear(void *y, blas_dtype_t y_type, const uint16_t *x, const uint16_t *W,
-                   int rows, int in, int out) {
+                   int rows, int in, int out, int split) {
     const float one = 1.0f, zero = 0.0f;
-    if (blasGemmEx(g_blas, BLAS_OP_T, BLAS_OP_N, out, rows, in, &one,
+    int k = in / split;
+    blas_status_t st = split == 1 ?
+        blasGemmEx(g_blas, BLAS_OP_T, BLAS_OP_N, out, rows, in, &one,
                    W, BLAS_R_16BF, in, x, BLAS_R_16BF, in, &zero,
-                   y, y_type, out, BLAS_COMPUTE_32F, BLAS_GEMM_DEFAULT) != BLAS_SUCCESS)
+                   y, y_type, out, BLAS_COMPUTE_32F, BLAS_GEMM_DEFAULT) :
+        blasGemmStridedBatchedEx(g_blas, BLAS_OP_T, BLAS_OP_N, out, rows, k, &one,
+                   W, BLAS_R_16BF, in, k, x, BLAS_R_16BF, in, k, &zero,
+                   y, y_type, out, (long long)rows * out, split,
+                   BLAS_COMPUTE_32F, BLAS_GEMM_DEFAULT);
+    if (st != BLAS_SUCCESS)
         fprintf(stderr, "iris_dev: GEMM %dx%dx%d failed\n", rows, out, in);
 }
 
@@ -428,25 +440,29 @@ extern "C" void iris_dev_linear_f32(float *y, const uint16_t *x, const uint16_t 
                                     int rows, int in, int out) {
 #ifdef IRIS_HIP
     /* rocBLAS has no fast bf16 -> f32 GEMM kernels on every GPU (4x slower
-     * on gfx1151), so produce bf16 and widen it. */
+     * on gfx1151), so produce bf16 and widen it. Long reductions are split
+     * in slices of at least 3072, summed in f32: rocBLAS picks much faster
+     * kernels for them (gfx1151, 4176 x 3072 x 12288: 18.2 -> 13.5 ms). */
+    int split = 1;
+    while (in % (16 * split) == 0 && in / (2 * split) >= 3072) split *= 2;
     size_t n = (size_t)rows * out;
-    if (n > g_gemm_scratch_elems) {
+    if (split * n > g_gemm_scratch_elems) {
         iris_dev_free(g_gemm_scratch);
-        g_gemm_scratch = (uint16_t *)iris_dev_alloc(n * sizeof(uint16_t));
-        g_gemm_scratch_elems = g_gemm_scratch ? n : 0;
+        g_gemm_scratch = (uint16_t *)iris_dev_alloc(split * n * sizeof(uint16_t));
+        g_gemm_scratch_elems = g_gemm_scratch ? split * n : 0;
     }
     if (g_gemm_scratch) {
-        linear(g_gemm_scratch, BLAS_R_16BF, x, W, rows, in, out);
-        k_bf16_to_f32<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(y, g_gemm_scratch, n);
+        linear(g_gemm_scratch, BLAS_R_16BF, x, W, rows, in, out, split);
+        k_sum_bf16<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(y, g_gemm_scratch, split, n);
         return;
     }
 #endif
-    linear(y, BLAS_R_32F, x, W, rows, in, out);
+    linear(y, BLAS_R_32F, x, W, rows, in, out, 1);
 }
 
 extern "C" void iris_dev_linear_bf16(uint16_t *y, const uint16_t *x, const uint16_t *W,
                                      int rows, int in, int out) {
-    linear(y, BLAS_R_16BF, x, W, rows, in, out);
+    linear(y, BLAS_R_16BF, x, W, rows, in, out, 1);
 }
 
 /* ========================================================================
@@ -488,8 +504,9 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
 /* ========================================================================
  * Flash Attention (ROCm, RDNA3 WMMA)
  *
- * Same tiling as the CUDA kernel (64 queries per block, one wave of 32
- * per 16 queries, 64-key tiles in LDS), adapted to the gfx11 WMMA layout:
+ * 128 queries per block, one wave of 32 per 16 queries, 64-key tiles in
+ * LDS (the next one is fetched into registers while the current one is
+ * processed), adapted to the gfx11 WMMA layout:
  * A and B operands hold a row / column per lane (replicated in both
  * half-waves), the accumulator holds column (lane % 16), rows
  * 2e + lane / 16. Computing the transposed products S^T = K Q^T and
@@ -498,29 +515,46 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
  * between the half-waves.
  * ======================================================================== */
 
-/* Load a 64-key tile: keys row-major into ks, values transposed into vt. */
-__device__ __forceinline__ void fa_load_tile(uint16_t (*ks)[FA_D + FA_PAD],
-                                             uint16_t (*vt)[FA_BC + FA_PAD],
-                                             const uint16_t *k, const uint16_t *v, int ldi,
-                                             size_t hoff, int k0, int seq_k) {
-    for (int i = threadIdx.x; i < FA_BC * FA_D / 8; i += blockDim.x) {
-        int r = i / (FA_D / 8), c8 = (i % (FA_D / 8)) * 8;
+#define FA_LOADS (FA_BC * FA_D / 8 / FA_THREADS)   /* 16-byte loads per thread per tile */
+
+/* Each thread's share of a 64-key tile, staged in registers so that the
+ * global loads of the next tile overlap the work on the current one. */
+__device__ __forceinline__ void fa_fetch_tile(uint4 *kr, uint4 *vr, const uint16_t *k,
+                                              const uint16_t *v, int ldi, size_t hoff,
+                                              int k0, int seq_k) {
+    for (int c = 0; c < FA_LOADS; c++) {
+        int i = threadIdx.x + c * FA_THREADS, r = i / (FA_D / 8), c8 = (i % (FA_D / 8)) * 8;
         int key = k0 + r;
-        uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+        kr[c] = vr[c] = make_uint4(0, 0, 0, 0);
         if (key < seq_k) {
-            kv = *(const uint4 *)(k + (size_t)key * ldi + hoff + c8);
-            vv = *(const uint4 *)(v + (size_t)key * ldi + hoff + c8);
+            kr[c] = *(const uint4 *)(k + (size_t)key * ldi + hoff + c8);
+            vr[c] = *(const uint4 *)(v + (size_t)key * ldi + hoff + c8);
         }
-        *(uint4 *)&ks[r][c8] = kv;
-        const uint16_t *ve = (const uint16_t *)&vv;
+    }
+}
+
+/* Store a fetched tile: keys row-major into ks, values transposed into vt. */
+__device__ __forceinline__ void fa_store_tile(uint16_t (*ks)[FA_D + FA_PAD],
+                                              uint16_t (*vt)[FA_BC + FA_PAD],
+                                              const uint4 *kr, const uint4 *vr) {
+    for (int c = 0; c < FA_LOADS; c++) {
+        int i = threadIdx.x + c * FA_THREADS, r = i / (FA_D / 8), c8 = (i % (FA_D / 8)) * 8;
+        *(uint4 *)&ks[r][c8] = kr[c];
+        const uint16_t *ve = (const uint16_t *)&vr[c];
         for (int j = 0; j < 8; j++) vt[c8 + j][r] = ve[j];
     }
+}
+
+/* The value of the lane in the other half-wave (lane ^ 16), without LDS. */
+__device__ __forceinline__ float fa_swap_halves(float v) {
+    return __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(v), __float_as_int(v),
+                                                       0x76543210, 0xfedcba98, false, false));
 }
 
 typedef short fa_bf16x16 __attribute__((ext_vector_type(16)));
 typedef float fa_f32x8 __attribute__((ext_vector_type(8)));
 
-__global__ void __launch_bounds__(128)
+__global__ void __launch_bounds__(FA_THREADS)
 k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
                   const uint16_t *v, int ldi, int seq_q, int seq_k, float scale_log2) {
 #if defined(__GFX11__)
@@ -542,50 +576,50 @@ k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
     for (int dt = 0; dt < 8; dt++) for (int e = 0; e < 8; e++) o[dt][e] = 0.0f;
     float m = -INFINITY, l = 0.0f;
 
+    uint4 kr[FA_LOADS], vr[FA_LOADS];
+    fa_fetch_tile(kr, vr, k, v, ldi, hoff, 0, seq_k);
     for (int k0 = 0; k0 < seq_k; k0 += FA_BC) {
         __syncthreads();
-        fa_load_tile(ks, vt, k, v, ldi, hoff, k0, seq_k);
+        fa_store_tile(ks, vt, kr, vr);
         __syncthreads();
+        if (k0 + FA_BC < seq_k) fa_fetch_tile(kr, vr, k, v, ldi, hoff, k0 + FA_BC, seq_k);
 
-        /* S^T for 4 subtiles of 16 keys: s[st][e] = score of key st*16 + 2e + half. */
-        fa_f32x8 s[4];
-        for (int st = 0; st < 4; st++) {
-            for (int e = 0; e < 8; e++) s[st][e] = 0.0f;
+        /* Online softmax per 16-key subtile (fewer live registers than a
+         * whole tile): s[e] = score of key k0 + st*16 + 2e + half. */
+        for (int st = 0; st < FA_BC / 16; st++) {
+            fa_f32x8 s;
+            for (int e = 0; e < 8; e++) s[e] = 0.0f;
             for (int kk = 0; kk < 8; kk++)
-                s[st] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
-                    *(const fa_bf16x16 *)&ks[st * 16 + col][kk * 16], qb[kk], s[st]);
-        }
+                s = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
+                    *(const fa_bf16x16 *)&ks[st * 16 + col][kk * 16], qb[kk], s);
 
-        float mx = m;
-        for (int st = 0; st < 4; st++)
+            float mx = m;
             for (int e = 0; e < 8; e++) {
-                if (k0 + st * 16 + 2 * e + half >= seq_k) s[st][e] = -INFINITY;
-                mx = fmaxf(mx, s[st][e] * scale_log2);
+                if (k0 + st * 16 + 2 * e + half >= seq_k) s[e] = -INFINITY;
+                mx = fmaxf(mx, s[e] * scale_log2);
             }
-        mx = fmaxf(mx, __shfl_xor(mx, 16));
-        float alpha = exp2f(m - mx);
-        m = mx;
+            mx = fmaxf(mx, fa_swap_halves(mx));
+            float alpha = exp2f(m - mx);
+            m = mx;
 
-        /* P^T as B operands: column = query, k = key within the subtile. The
-         * even keys live in half 0, the odd ones in half 1. */
-        float rs = 0.0f;
-        fa_bf16x16 pb[4];
-        for (int st = 0; st < 4; st++)
+            /* P^T as a B operand: column = query, k = key within the subtile.
+             * The even keys live in half 0, the odd ones in half 1. */
+            float rs = 0.0f;
+            fa_bf16x16 pb;
             for (int e = 0; e < 8; e++) {
-                float p = exp2f(s[st][e] * scale_log2 - m);
+                float p = exp2f(s[e] * scale_log2 - m);
                 rs += p;
-                short mine = (short)f2bf(p), other = (short)f2bf(__shfl_xor(p, 16));
-                pb[st][2 * e] = half ? other : mine;
-                pb[st][2 * e + 1] = half ? mine : other;
+                short mine = (short)f2bf(p), other = (short)f2bf(fa_swap_halves(p));
+                pb[2 * e] = half ? other : mine;
+                pb[2 * e + 1] = half ? mine : other;
             }
-        rs += __shfl_xor(rs, 16);
-        l = l * alpha + rs;
+            l = l * alpha + rs + fa_swap_halves(rs);
 
-        for (int dt = 0; dt < 8; dt++) {
-            for (int e = 0; e < 8; e++) o[dt][e] *= alpha;
-            for (int st = 0; st < 4; st++)
+            for (int dt = 0; dt < 8; dt++) {
+                for (int e = 0; e < 8; e++) o[dt][e] *= alpha;
                 o[dt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
-                    *(const fa_bf16x16 *)&vt[dt * 16 + col][st * 16], pb[st], o[dt]);
+                    *(const fa_bf16x16 *)&vt[dt * 16 + col][st * 16], pb, o[dt]);
+            }
         }
     }
 
@@ -602,7 +636,7 @@ k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
  * Flash Attention (CUDA, tensor cores)
  *
  * FlashAttention-2 forward for head_dim 128 with mma.sync m16n8k16 bf16
- * instructions. A block handles 64 queries of one head (4 warps, 16 rows
+ * instructions. A block handles 128 queries of one head (8 warps, 16 rows
  * each) and streams the keys in tiles of 64 through shared memory, double
  * buffered with cp.async; operand fragments come from ldmatrix (.trans for
  * V, kept row-major). Scores stay in registers with an online softmax and
@@ -654,7 +688,7 @@ __device__ __forceinline__ void fa_issue_tile(uint16_t *ks, uint16_t *vs, const 
     asm volatile("cp.async.commit_group;\n");
 }
 
-__global__ void __launch_bounds__(128)
+__global__ void __launch_bounds__(FA_THREADS)
 k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
                   const uint16_t *v, int ldi, int seq_q, int seq_k, float scale_log2) {
     extern __shared__ __align__(16) uint16_t fa_smem[];
@@ -802,7 +836,7 @@ extern "C" void iris_dev_attention(uint16_t *out, int ldo,
 #else
         size_t smem = FA_SMEM;
 #endif
-        k_flash_attention<<<grid, 128, smem, g_stream>>>(out, ldo, q, k, v, ldi, seq_q, seq_k,
+        k_flash_attention<<<grid, FA_THREADS, smem, g_stream>>>(out, ldo, q, k, v, ldi, seq_q, seq_k,
                                                          scale * 1.4426950408889634f);
         return;
     }
@@ -864,18 +898,33 @@ extern "C" void iris_dev_add_bias(float *y, const float *bias, int rows, int col
 
 /* Columns for output pixels [p0, p0 + np): row p holds the k x k
  * neighborhood, (ky, kx, c) order, zero outside the image. */
+/* Each thread converts V consecutive channels of one tap, V = 1 or 8
+ * (cin % 8 == 0: 16-byte loads and stores). n counts the groups of V and
+ * fits an int, the scratch being bounded. */
+template <int V>
 __global__ void k_im2col(uint16_t *cols, const float *in, int h, int w, int cin, int k,
-                         int stride, int pad, int ow, int p0, size_t n) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+                         int stride, int pad, int ow, int p0, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    int row_len = k * k * cin;
-    int p = p0 + (int)(i / row_len);
-    int r = (int)(i % row_len);
+    int row_groups = k * k * cin / V;
+    int p = p0 + i / row_groups;
+    int r = (i % row_groups) * V;
     int tap = r / cin, c = r % cin;
     int y = (p / ow) * stride + tap / k - pad;
     int x = (p % ow) * stride + tap % k - pad;
-    float v = (y >= 0 && y < h && x >= 0 && x < w) ? in[((size_t)y * w + x) * cin + c] : 0.0f;
-    cols[i] = f2bf(v);
+    const float *src = in + ((size_t)y * w + x) * cin + c;
+    int inside = y >= 0 && y < h && x >= 0 && x < w;
+    if (V == 8) {
+        float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f), b = a;
+        if (inside) {
+            a = ((const float4 *)src)[0];
+            b = ((const float4 *)src)[1];
+        }
+        *(uint4 *)(cols + (size_t)i * 8) = make_uint4(pack_bf16x2(a.x, a.y), pack_bf16x2(a.z, a.w),
+                                                      pack_bf16x2(b.x, b.y), pack_bf16x2(b.z, b.w));
+    } else {
+        cols[i] = inside ? f2bf(src[0]) : 0;
+    }
 }
 
 extern "C" void iris_dev_conv2d(float *out, const float *in, const uint16_t *w, const float *bias,
@@ -894,10 +943,18 @@ extern "C" void iris_dev_conv2d(float *out, const float *in, const uint16_t *w, 
     if (chunk > ohw) chunk = ohw;
     for (int p0 = 0; p0 < ohw; p0 += chunk) {
         int np = ohw - p0 < chunk ? ohw - p0 : chunk;
-        size_t n = (size_t)np * row_len;
-        k_im2col<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(g_conv_scratch, in, h, width, cin, k,
-                                                            stride, pad_before, ow, p0, n);
-        linear(out + (size_t)p0 * cout, BLAS_R_32F, g_conv_scratch, w, np, row_len, cout);
+        if (cin % 8 == 0) {
+            int n = np * row_len / 8;
+            k_im2col<8><<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(g_conv_scratch, in, h, width,
+                                                                   cin, k, stride, pad_before,
+                                                                   ow, p0, n);
+        } else {
+            int n = np * row_len;
+            k_im2col<1><<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(g_conv_scratch, in, h, width,
+                                                                   cin, k, stride, pad_before,
+                                                                   ow, p0, n);
+        }
+        iris_dev_linear_f32(out + (size_t)p0 * cout, g_conv_scratch, w, np, row_len, cout);
     }
     if (bias) iris_dev_add_bias(out, bias, ohw, cout);
 }
