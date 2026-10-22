@@ -103,7 +103,7 @@ static size_t g_gn_scratch_size = 0;
 
 __global__ void k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
                                   const uint16_t *v, int ldi, int seq_q, int seq_k,
-                                  float scale_log2);
+                                  float scale_log2, const int *key_mask);
 
 static void check(GPU(Error_t) err, const char *what) {
     if (err != GPU(Success))
@@ -292,6 +292,11 @@ __global__ void k_add(float *x, const float *a, size_t n) {
     if (i < n) x[i] += a[i];
 }
 
+__global__ void k_fill_rows(float *out, const float *row, int dim, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = row[i % dim];
+}
+
 __global__ void k_swiglu(uint16_t *out, int ldo, const uint16_t *gate,
                          const uint16_t *up, int ldi, int cols, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -318,6 +323,11 @@ extern "C" void iris_dev_silu(float *x, size_t n) {
 
 extern "C" void iris_dev_add(float *x, const float *a, size_t n) {
     if (n) k_add<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(x, a, n);
+}
+
+extern "C" void iris_dev_fill_rows(float *out, const float *row, int rows, int dim) {
+    size_t n = (size_t)rows * dim;
+    if (n) k_fill_rows<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(out, row, dim, n);
 }
 
 extern "C" void iris_dev_swiglu(uint16_t *out, int ldo, const uint16_t *gate,
@@ -353,13 +363,14 @@ __global__ void k_layer_norm_mod(uint16_t *out, const float *x, const float *shi
     float inv = rsqrtf(block_reduce(v, sh, 0) / dim + eps);
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float n = (xr[i] - mean) * inv;
-        if (scale) n = n * (1.0f + scale[i]) + shift[i];
+        if (scale) n *= 1.0f + scale[i];
+        if (shift) n += shift[i];
         o[i] = f2bf(n);
     }
 }
 
 __global__ void k_rms_norm(uint16_t *out, const float *x, const float *w,
-                           int dim, float eps) {
+                           const float *scale, int dim, float eps) {
     __shared__ float sh[ROW_THREADS];
     const float *xr = x + (size_t)blockIdx.x * dim;
     uint16_t *o = out + (size_t)blockIdx.x * dim;
@@ -367,7 +378,25 @@ __global__ void k_rms_norm(uint16_t *out, const float *x, const float *w,
     float s = 0;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) s += xr[i] * xr[i];
     float inv = rsqrtf(block_reduce(s, sh, 0) / dim + eps);
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) o[i] = f2bf(xr[i] * inv * w[i]);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = xr[i] * inv * w[i];
+        if (scale) v *= 1.0f + scale[i];
+        o[i] = f2bf(v);
+    }
+}
+
+__global__ void k_rms_norm_residual(float *x, const float *a, const float *w,
+                                    const float *gate, int dim, float eps) {
+    __shared__ float sh[ROW_THREADS];
+    const float *ar = a + (size_t)blockIdx.x * dim;
+    float *xr = x + (size_t)blockIdx.x * dim;
+    float s = 0;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) s += ar[i] * ar[i];
+    float inv = rsqrtf(block_reduce(s, sh, 0) / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = ar[i] * inv * w[i];
+        xr[i] += (gate ? tanhf(gate[i]) : 1.0f) * v;
+    }
 }
 
 /* One block per (row, head), one thread per rotated pair. */
@@ -399,7 +428,18 @@ extern "C" void iris_dev_layer_norm_mod(uint16_t *out, const float *x,
 
 extern "C" void iris_dev_rms_norm(uint16_t *out, const float *x, const float *w,
                                   int rows, int dim, float eps) {
-    if (rows > 0) k_rms_norm<<<rows, ROW_THREADS, 0, g_stream>>>(out, x, w, dim, eps);
+    if (rows > 0) k_rms_norm<<<rows, ROW_THREADS, 0, g_stream>>>(out, x, w, NULL, dim, eps);
+}
+
+extern "C" void iris_dev_rms_norm_mod(uint16_t *out, const float *x, const float *w,
+                                      const float *scale, int rows, int dim, float eps) {
+    if (rows > 0) k_rms_norm<<<rows, ROW_THREADS, 0, g_stream>>>(out, x, w, scale, dim, eps);
+}
+
+extern "C" void iris_dev_rms_norm_residual(float *x, const float *a, const float *w,
+                                           const float *gate, int rows, int dim, float eps) {
+    if (rows > 0)
+        k_rms_norm_residual<<<rows, ROW_THREADS, 0, g_stream>>>(x, a, w, gate, dim, eps);
 }
 
 extern "C" void iris_dev_head_norm_rope(uint16_t *x, int ld, const float *w,
@@ -556,7 +596,8 @@ typedef float fa_f32x8 __attribute__((ext_vector_type(8)));
 
 __global__ void __launch_bounds__(FA_THREADS)
 k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
-                  const uint16_t *v, int ldi, int seq_q, int seq_k, float scale_log2) {
+                  const uint16_t *v, int ldi, int seq_q, int seq_k, float scale_log2,
+                  const int *key_mask) {
 #if defined(__GFX11__)
     __shared__ __align__(16) uint16_t ks[FA_BC][FA_D + FA_PAD];
     __shared__ __align__(16) uint16_t vt[FA_D][FA_BC + FA_PAD];
@@ -584,6 +625,13 @@ k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
         __syncthreads();
         if (k0 + FA_BC < seq_k) fa_fetch_tile(kr, vr, k, v, ldi, hoff, k0 + FA_BC, seq_k);
 
+        /* Bit i: key k0 + i is in range and not masked. Wave-uniform, built
+         * once per tile: reading the mask in the score loop spills registers. */
+        int ka = k0 + lane, kb = ka + 32;
+        unsigned long long keys =
+            (__ballot(ka < seq_k && (!key_mask || key_mask[ka])) & 0xffffffffull) |
+            ((unsigned long long)__ballot(kb < seq_k && (!key_mask || key_mask[kb])) << 32);
+
         /* Online softmax per 16-key subtile (fewer live registers than a
          * whole tile): s[e] = score of key k0 + st*16 + 2e + half. */
         for (int st = 0; st < FA_BC / 16; st++) {
@@ -595,11 +643,12 @@ k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
 
             float mx = m;
             for (int e = 0; e < 8; e++) {
-                if (k0 + st * 16 + 2 * e + half >= seq_k) s[e] = -INFINITY;
+                if (!((keys >> (st * 16 + 2 * e + half)) & 1)) s[e] = -INFINITY;
                 mx = fmaxf(mx, s[e] * scale_log2);
             }
             mx = fmaxf(mx, fa_swap_halves(mx));
-            float alpha = exp2f(m - mx);
+            float mr = mx == -INFINITY ? 0.0f : mx;   /* finite while all keys are masked */
+            float alpha = exp2f(m - mr);
             m = mx;
 
             /* P^T as a B operand: column = query, k = key within the subtile.
@@ -607,7 +656,7 @@ k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
             float rs = 0.0f;
             fa_bf16x16 pb;
             for (int e = 0; e < 8; e++) {
-                float p = exp2f(s[e] * scale_log2 - m);
+                float p = exp2f(s[e] * scale_log2 - mr);
                 rs += p;
                 short mine = (short)f2bf(p), other = (short)f2bf(fa_swap_halves(p));
                 pb[2 * e] = half ? other : mine;
@@ -624,7 +673,7 @@ k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
     }
 
     if (qrow < seq_q) {
-        float il = 1.0f / l;
+        float il = l > 0.0f ? 1.0f / l : 0.0f;
         uint16_t *orow = out + (size_t)qrow * ldo + hoff;
         for (int dt = 0; dt < 8; dt++)
             for (int e = 0; e < 8; e++) orow[dt * 16 + 2 * e + half] = f2bf(o[dt][e] * il);
@@ -690,7 +739,8 @@ __device__ __forceinline__ void fa_issue_tile(uint16_t *ks, uint16_t *vs, const 
 
 __global__ void __launch_bounds__(FA_THREADS)
 k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
-                  const uint16_t *v, int ldi, int seq_q, int seq_k, float scale_log2) {
+                  const uint16_t *v, int ldi, int seq_q, int seq_k, float scale_log2,
+                  const int *key_mask) {
     extern __shared__ __align__(16) uint16_t fa_smem[];
     uint16_t *kst[2] = {fa_smem, fa_smem + 2 * FA_BC * FA_STRIDE};
     uint16_t *vst[2] = {fa_smem + FA_BC * FA_STRIDE, fa_smem + 3 * FA_BC * FA_STRIDE};
@@ -740,10 +790,12 @@ k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
                 mma_16816(s[j], qa[kk + 1], b[2], b[3]);
             }
         }
-        if (k0 + FA_BC > seq_k) {
+        if (key_mask || k0 + FA_BC > seq_k) {
             for (int j = 0; j < 8; j++)
-                for (int e = 0; e < 4; e++)
-                    if (k0 + j * 8 + 2 * t + (e & 1) >= seq_k) s[j][e] = -INFINITY;
+                for (int e = 0; e < 4; e++) {
+                    int key = k0 + j * 8 + 2 * t + (e & 1);
+                    if (key >= seq_k || (key_mask && !key_mask[key])) s[j][e] = -INFINITY;
+                }
         }
 
         /* Online softmax (base 2) for rows r0 (elements 0, 1) and r1 (2, 3). */
@@ -756,14 +808,16 @@ k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
             mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, off));
             mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, off));
         }
-        float a0 = exp2f(m0 - mx0), a1 = exp2f(m1 - mx1);
+        /* Finite references while all keys of a row are masked. */
+        float e0 = mx0 == -INFINITY ? 0.0f : mx0, e1 = mx1 == -INFINITY ? 0.0f : mx1;
+        float a0 = exp2f(m0 - e0), a1 = exp2f(m1 - e1);
         m0 = mx0;
         m1 = mx1;
         float rs0 = 0.0f, rs1 = 0.0f;
         uint32_t pa[4][4];   /* P as A fragments, k-step kk = keys [16kk, 16kk + 16) */
         for (int j = 0; j < 8; j++) {
-            float p00 = exp2f(s[j][0] * scale_log2 - m0), p01 = exp2f(s[j][1] * scale_log2 - m0);
-            float p10 = exp2f(s[j][2] * scale_log2 - m1), p11 = exp2f(s[j][3] * scale_log2 - m1);
+            float p00 = exp2f(s[j][0] * scale_log2 - e0), p01 = exp2f(s[j][1] * scale_log2 - e0);
+            float p10 = exp2f(s[j][2] * scale_log2 - e1), p11 = exp2f(s[j][3] * scale_log2 - e1);
             rs0 += p00 + p01;
             rs1 += p10 + p11;
             pa[j / 2][(j % 2) * 2] = pack_bf16x2(p00, p01);
@@ -796,7 +850,7 @@ k_flash_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
         __syncthreads();   /* this stage is refilled by the next iteration */
     }
 
-    float il0 = 1.0f / l0, il1 = 1.0f / l1;
+    float il0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, il1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
     for (int n = 0; n < 16; n++) {
         int d = n * 8 + 2 * t;
         if (r0 < seq_q)
@@ -827,7 +881,7 @@ extern "C" void iris_dev_attention(uint16_t *out, int ldo,
                                    int head_dim, float scale, int causal,
                                    const int *key_mask) {
     /* 16-byte aligned rows are needed by the vectorized tile loads. */
-    if (g_flash && head_dim == FA_D && heads == kv_heads && !causal && !key_mask &&
+    if (g_flash && head_dim == FA_D && heads == kv_heads && !causal &&
         ldi % 8 == 0 && ldo % 2 == 0 &&
         ((uintptr_t)q | (uintptr_t)k | (uintptr_t)v | (uintptr_t)out) % 16 == 0) {
         dim3 grid((seq_q + FA_BR - 1) / FA_BR, heads);
@@ -837,7 +891,7 @@ extern "C" void iris_dev_attention(uint16_t *out, int ldo,
         size_t smem = FA_SMEM;
 #endif
         k_flash_attention<<<grid, FA_THREADS, smem, g_stream>>>(out, ldo, q, k, v, ldi, seq_q, seq_k,
-                                                         scale * 1.4426950408889634f);
+                                                         scale * 1.4426950408889634f, key_mask);
         return;
     }
     size_t per_query = (size_t)heads * seq_k * (sizeof(float) + sizeof(uint16_t));

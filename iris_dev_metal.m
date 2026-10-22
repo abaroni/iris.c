@@ -41,7 +41,8 @@ static float *g_gn_scratch = NULL;
 static size_t g_gn_scratch_size = 0;
 
 static id<MTLComputePipelineState> p_f32_to_bf16, p_silu, p_add, p_add_bias, p_swiglu,
-    p_residual, p_layer_norm_mod, p_rms_norm, p_head_norm_rope, p_copy_2d, p_im2col,
+    p_residual, p_fill_rows, p_layer_norm_mod, p_rms_norm, p_rms_norm_residual, p_key_mask_bias,
+    p_head_norm_rope, p_copy_2d, p_im2col,
     p_gn_partial, p_gn_finalize, p_gn_apply, p_upsample2x;
 
 /* ========================================================================
@@ -100,6 +101,11 @@ kernel void swiglu(device ushort *out, device const ushort *gate, device const u
     out[r * ldo + c] = f2bf(g / (1.0f + exp(-g)) * bf2f(up[r * ldi + c]));
 }
 
+kernel void fill_rows(device float *out, device const float *row, constant int &dim,
+                      constant ulong &n, uint i [[thread_position_in_grid]]) {
+    if (i < n) out[i] = row[i % dim];
+}
+
 kernel void residual(device float *x, device const float *a, device const float *gate,
                      constant int &dim, constant int &has_gate, constant ulong &n,
                      uint i [[thread_position_in_grid]]) {
@@ -108,7 +114,8 @@ kernel void residual(device float *x, device const float *a, device const float 
 
 kernel void layer_norm_mod(device ushort *out, device const float *x, device const float *shift,
                            device const float *scale, constant int &dim, constant float &eps,
-                           constant int &has_mod, uint row [[threadgroup_position_in_grid]],
+                           constant int &has_shift, constant int &has_scale,
+                           uint row [[threadgroup_position_in_grid]],
                            uint tid [[thread_position_in_threadgroup]],
                            uint nt [[threads_per_threadgroup]]) {
     threadgroup float sh[256];
@@ -122,13 +129,15 @@ kernel void layer_norm_mod(device ushort *out, device const float *x, device con
     float inv = rsqrt(group_reduce(v, sh, tid, nt, false) / dim + eps);
     for (int i = tid; i < dim; i += nt) {
         float n = (xr[i] - mean) * inv;
-        if (has_mod) n = n * (1.0f + scale[i]) + shift[i];
+        if (has_scale) n *= 1.0f + scale[i];
+        if (has_shift) n += shift[i];
         o[i] = f2bf(n);
     }
 }
 
 kernel void rms_norm(device ushort *out, device const float *x, device const float *w,
-                     constant int &dim, constant float &eps,
+                     device const float *scale, constant int &dim, constant float &eps,
+                     constant int &has_scale,
                      uint row [[threadgroup_position_in_grid]],
                      uint tid [[thread_position_in_threadgroup]],
                      uint nt [[threads_per_threadgroup]]) {
@@ -138,7 +147,32 @@ kernel void rms_norm(device ushort *out, device const float *x, device const flo
     float s = 0;
     for (int i = tid; i < dim; i += nt) s += xr[i] * xr[i];
     float inv = rsqrt(group_reduce(s, sh, tid, nt, false) / dim + eps);
-    for (int i = tid; i < dim; i += nt) o[i] = f2bf(xr[i] * inv * w[i]);
+    for (int i = tid; i < dim; i += nt) {
+        float v = xr[i] * inv * w[i];
+        if (has_scale) v *= 1.0f + scale[i];
+        o[i] = f2bf(v);
+    }
+}
+
+kernel void rms_norm_residual(device float *x, device const float *a, device const float *w,
+                              device const float *gate, constant int &dim, constant float &eps,
+                              constant int &has_gate, uint row [[threadgroup_position_in_grid]],
+                              uint tid [[thread_position_in_threadgroup]],
+                              uint nt [[threads_per_threadgroup]]) {
+    threadgroup float sh[256];
+    device const float *ar = a + (ulong)row * dim;
+    device float *xr = x + (ulong)row * dim;
+    float s = 0;
+    for (int i = tid; i < dim; i += nt) s += ar[i] * ar[i];
+    float inv = rsqrt(group_reduce(s, sh, tid, nt, false) / dim + eps);
+    for (int i = tid; i < dim; i += nt)
+        xr[i] += (has_gate ? precise::tanh(gate[i]) : 1.0f) * ar[i] * inv * w[i];
+}
+
+/* Additive attention mask: 0 for kept keys, -inf for masked ones. */
+kernel void key_mask_bias(device ushort *bias, device const int *mask, constant ulong &n,
+                          uint i [[thread_position_in_grid]]) {
+    if (i < n) bias[i] = mask[i] ? 0 : 0xFF80;
 }
 
 kernel void head_norm_rope(device ushort *x, device const float *w, device const float *rc,
@@ -268,8 +302,11 @@ int iris_dev_init(void) {
         p_add_bias = pipeline(lib, @"add_bias");
         p_swiglu = pipeline(lib, @"swiglu");
         p_residual = pipeline(lib, @"residual");
+        p_fill_rows = pipeline(lib, @"fill_rows");
         p_layer_norm_mod = pipeline(lib, @"layer_norm_mod");
         p_rms_norm = pipeline(lib, @"rms_norm");
+        p_rms_norm_residual = pipeline(lib, @"rms_norm_residual");
+        p_key_mask_bias = pipeline(lib, @"key_mask_bias");
         p_head_norm_rope = pipeline(lib, @"head_norm_rope");
         p_copy_2d = pipeline(lib, @"copy_2d");
         p_im2col = pipeline(lib, @"im2col");
@@ -278,7 +315,8 @@ int iris_dev_init(void) {
         p_gn_apply = pipeline(lib, @"gn_apply");
         p_upsample2x = pipeline(lib, @"upsample2x");
         if (!p_f32_to_bf16 || !p_silu || !p_add || !p_add_bias || !p_swiglu || !p_residual ||
-            !p_layer_norm_mod || !p_rms_norm || !p_head_norm_rope || !p_copy_2d || !p_im2col ||
+            !p_fill_rows || !p_layer_norm_mod || !p_rms_norm || !p_rms_norm_residual ||
+            !p_key_mask_bias || !p_head_norm_rope || !p_copy_2d || !p_im2col ||
             !p_gn_partial || !p_gn_finalize || !p_gn_apply || !p_upsample2x)
             return 0;
         g_buffers = [NSMutableArray array];
@@ -496,6 +534,19 @@ void iris_dev_swiglu(uint16_t *out, int ldo, const uint16_t *gate, const uint16_
     }
 }
 
+void iris_dev_fill_rows(float *out, const float *row, int rows, int dim) {
+    size_t n = (size_t)rows * dim;
+    if (!n) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_fill_rows);
+        arg_ptr(e, out, 0);
+        arg_ptr(e, row, 1);
+        arg_int(e, dim, 2);
+        arg_ulong(e, n, 3);
+        end_elementwise(e, n);
+    }
+}
+
 void iris_dev_residual(float *x, const float *a, const float *gate, int rows, int dim) {
     size_t n = (size_t)rows * dim;
     if (!n) return;
@@ -522,6 +573,23 @@ void iris_dev_layer_norm_mod(uint16_t *out, const float *x, const float *shift,
         arg_ptr(e, scale, 3);
         arg_int(e, dim, 4);
         arg_float(e, eps, 5);
+        arg_int(e, shift != NULL, 6);
+        arg_int(e, scale != NULL, 7);
+        end_rows(e, rows);
+    }
+}
+
+void iris_dev_rms_norm_mod(uint16_t *out, const float *x, const float *w, const float *scale,
+                           int rows, int dim, float eps) {
+    if (rows <= 0) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_rms_norm);
+        arg_ptr(e, out, 0);
+        arg_ptr(e, x, 1);
+        arg_ptr(e, w, 2);
+        arg_ptr(e, scale, 3);
+        arg_int(e, dim, 4);
+        arg_float(e, eps, 5);
         arg_int(e, scale != NULL, 6);
         end_rows(e, rows);
     }
@@ -529,14 +597,21 @@ void iris_dev_layer_norm_mod(uint16_t *out, const float *x, const float *shift,
 
 void iris_dev_rms_norm(uint16_t *out, const float *x, const float *w, int rows, int dim,
                        float eps) {
+    iris_dev_rms_norm_mod(out, x, w, NULL, rows, dim, eps);
+}
+
+void iris_dev_rms_norm_residual(float *x, const float *a, const float *w, const float *gate,
+                                int rows, int dim, float eps) {
     if (rows <= 0) return;
     @autoreleasepool {
-        id<MTLComputeCommandEncoder> e = begin(p_rms_norm);
-        arg_ptr(e, out, 0);
-        arg_ptr(e, x, 1);
+        id<MTLComputeCommandEncoder> e = begin(p_rms_norm_residual);
+        arg_ptr(e, x, 0);
+        arg_ptr(e, a, 1);
         arg_ptr(e, w, 2);
-        arg_int(e, dim, 3);
-        arg_float(e, eps, 4);
+        arg_ptr(e, gate, 3);
+        arg_int(e, dim, 4);
+        arg_float(e, eps, 5);
+        arg_int(e, gate != NULL, 6);
         end_rows(e, rows);
     }
 }
@@ -650,9 +725,10 @@ void iris_dev_linear_bf16(uint16_t *y, const uint16_t *x, const uint16_t *W, int
     linear(y, MPSDataTypeBFloat16, x, W, rows, in, out);
 }
 
-static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, float scale) {
-    NSString *key = [NSString stringWithFormat:@"sdpa %d %d %d %d %a", seq_q, seq_k, heads,
-                                               head_dim, scale];
+static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, float scale,
+                                int masked) {
+    NSString *key = [NSString stringWithFormat:@"sdpa %d %d %d %d %a %d", seq_q, seq_k, heads,
+                                               head_dim, scale, masked];
     IrisDevGraph *g = g_graphs[key];
     if (g) return g;
     g = [IrisDevGraph new];
@@ -664,11 +740,21 @@ static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, f
     MPSGraphTensor *qt = [g.graph transposeTensor:q dimension:1 withDimension:2 name:nil];
     MPSGraphTensor *kt = [g.graph transposeTensor:k dimension:1 withDimension:2 name:nil];
     MPSGraphTensor *vt = [g.graph transposeTensor:v dimension:1 withDimension:2 name:nil];
-    MPSGraphTensor *o = [g.graph scaledDotProductAttentionWithQueryTensor:qt keyTensor:kt
-                                                             valueTensor:vt scale:scale name:nil];
+    MPSGraphTensor *o;
+    if (masked) {
+        NSArray *ms = @[@1, @1, @1, @(seq_k)];
+        MPSGraphTensor *m = [g.graph placeholderWithShape:ms dataType:MPSDataTypeBFloat16 name:nil];
+        o = [g.graph scaledDotProductAttentionWithQueryTensor:qt keyTensor:kt valueTensor:vt
+                                                   maskTensor:m scale:scale name:nil];
+        g.inputs = @[q, k, v, m];
+        g.shapes = @[qs, ks, ks, ms];
+    } else {
+        o = [g.graph scaledDotProductAttentionWithQueryTensor:qt keyTensor:kt valueTensor:vt
+                                                        scale:scale name:nil];
+        g.inputs = @[q, k, v];
+        g.shapes = @[qs, ks, ks];
+    }
     o = [g.graph transposeTensor:o dimension:1 withDimension:2 name:nil];
-    g.inputs = @[q, k, v];
-    g.shapes = @[qs, ks, ks];
     g.output = o;
     g.outShape = qs;
     g.outType = MPSDataTypeBFloat16;
@@ -677,21 +763,21 @@ static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, f
 }
 
 /* Attention through MPSGraph's fused SDPA, on contiguous copies of q, k, v
- * when they are strided views. Supports the unmasked, non-causal case with
- * one kv head per query head. */
+ * when they are strided views; the key mask becomes an additive bias.
+ * Supports the non-causal case with one kv head per query head. */
 void iris_dev_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
                         const uint16_t *v, int ldi, int seq_q, int seq_k, int heads,
                         int kv_heads, int head_dim, float scale, int causal,
                         const int *key_mask) {
-    if (causal || key_mask || kv_heads != heads) {
-        fprintf(stderr, "iris_dev: Metal attention supports only unmasked MHA\n");
+    if (causal || kv_heads != heads) {
+        fprintf(stderr, "iris_dev: Metal attention supports only non-causal MHA\n");
         return;
     }
     @autoreleasepool {
         int dim = heads * head_dim;
         int strided = ldi != dim, out_strided = ldo != dim;
         size_t need = (size_t)(strided ? seq_q + 2 * seq_k : 0) * dim +
-                      (size_t)(out_strided ? seq_q : 0) * dim;
+                      (size_t)(out_strided ? seq_q : 0) * dim + (key_mask ? seq_k : 0);
         if (need > g_attn_scratch_elems) {
             iris_dev_free(g_attn_scratch);
             g_attn_scratch = iris_dev_alloc(need * sizeof(uint16_t));
@@ -711,9 +797,19 @@ void iris_dev_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_
             s = vs + (size_t)seq_k * dim;
         }
         uint16_t *oc = out_strided ? s : out;
-        IrisDevGraph *g = sdpa_graph(seq_q, seq_k, heads, head_dim, scale);
-        run_graph(g, @[[NSValue valueWithPointer:qc], [NSValue valueWithPointer:kc],
-                       [NSValue valueWithPointer:vc]], oc);
+        if (out_strided) s += (size_t)seq_q * dim;
+        NSMutableArray *ptrs = [NSMutableArray arrayWithObjects:[NSValue valueWithPointer:qc],
+                                [NSValue valueWithPointer:kc], [NSValue valueWithPointer:vc], nil];
+        if (key_mask) {
+            id<MTLComputeCommandEncoder> e = begin(p_key_mask_bias);
+            arg_ptr(e, s, 0);
+            arg_ptr(e, key_mask, 1);
+            arg_ulong(e, seq_k, 2);
+            end_elementwise(e, seq_k);
+            [ptrs addObject:[NSValue valueWithPointer:s]];
+        }
+        IrisDevGraph *g = sdpa_graph(seq_q, seq_k, heads, head_dim, scale, key_mask != NULL);
+        run_graph(g, ptrs, oc);
         if (out_strided) copy_2d(out, ldo, oc, dim, seq_q, dim);
     }
 }

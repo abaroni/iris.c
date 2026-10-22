@@ -53,7 +53,7 @@ void iris_dev_linear_bf16(uint16_t *y, const uint16_t *x, const uint16_t *W,
                           int rows, int in, int out);
 
 /* out = LayerNorm(x) * (1 + scale) + shift, no affine parameters.
- * shift/scale: [dim], or both NULL for a plain LayerNorm. */
+ * shift/scale: [dim], either may be NULL (zero). */
 void iris_dev_layer_norm_mod(uint16_t *out, const float *x,
                              const float *shift, const float *scale,
                              int rows, int dim, float eps);
@@ -61,6 +61,15 @@ void iris_dev_layer_norm_mod(uint16_t *out, const float *x,
 /* out = RMSNorm(x) * w, w: [dim] */
 void iris_dev_rms_norm(uint16_t *out, const float *x, const float *w,
                        int rows, int dim, float eps);
+
+/* RMSNorm(x) * w * (1 + scale), with optional scale [dim]. */
+void iris_dev_rms_norm_mod(uint16_t *out, const float *x, const float *w,
+                           const float *scale, int rows, int dim, float eps);
+
+/* x += tanh(gate) * RMSNorm(a) * w, entirely in f32.
+ * gate [dim] may be NULL for an ungated residual. */
+void iris_dev_rms_norm_residual(float *x, const float *a, const float *w,
+                                const float *gate, int rows, int dim, float eps);
 
 /* In place on the bf16 heads x[s, h * head_dim + d] (row stride ld):
  * per-head RMSNorm with weight w [head_dim], then rotation by the angles of
@@ -95,6 +104,7 @@ void iris_dev_residual(float *x, const float *a, const float *gate,
 void iris_dev_silu(float *x, size_t n);
 void iris_dev_add(float *x, const float *a, size_t n);   /* x += a */
 void iris_dev_add_bias(float *y, const float *bias, int rows, int cols);  /* y[r, c] += bias[c] */
+void iris_dev_fill_rows(float *out, const float *row, int rows, int dim); /* out[r, c] = row[c] */
 
 /* Convolution layers on channels-last f32 images [h * w, channels]. */
 

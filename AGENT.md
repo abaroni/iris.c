@@ -77,11 +77,11 @@ main.c                    - CLI entry point
 # Build Targets
 
 This project implements five targets:
-- MPS: Apple Silicon GPU path. The FLUX.2 / FLUX.3 transformers use iris_dev.h
-  (iris_dev_metal.m); the rest uses iris_metal.m.
+- MPS: Apple Silicon GPU path. The transformers use iris_dev.h
+  (iris_dev_metal.m); the text encoder and the VAE use iris_metal.m.
 - CUDA / ROCm: NVIDIA / AMD GPU path (iris_dev.h, implemented by iris_cuda.cu,
-  one source for nvcc and hipcc). FLUX.2 / FLUX.3 transformers, Qwen3 text
-  encoder and VAE; the Z-Image transformer runs on the CPU there.
+  one source for nvcc and hipcc). All the transformers, the Qwen3 text
+  encoder and the VAE.
 - BLAS: optimized CPU inference via BLAS/OpenBLAS.
 - generic: pure C fallback, very slow.
 
@@ -454,16 +454,17 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
   Never key device data on host pointers (see the Metal pitfalls above).
 - GEMMs: bf16 inputs, f32 accumulation. Fused weights are assembled on the
   device with iris_dev_upload()/iris_dev_upload_2d().
-- Attention: flash kernels for head_dim 128, unmasked (CUDA: mma.sync +
-  cp.async + ldmatrix; ROCm: gfx11 WMMA, computing transposed products so each
-  lane owns a query). Other cases use batched GEMMs around a softmax.
+- Attention: flash kernels for head_dim 128, non-causal, optional key mask
+  (CUDA: mma.sync + cp.async + ldmatrix; ROCm: gfx11 WMMA, computing transposed
+  products so each lane owns a query). Other cases use batched GEMMs around a
+  softmax.
 - Uploads: CUDA goes through pinned staging buffers.
 - Metal (iris_dev_metal.m): device pointers are the CPU addresses of shared
   MTLBuffers, mapped back to (buffer, offset) by a sorted allocation table.
   Work goes into one command buffer, committed by sync/download/upload/free.
   GEMMs and attention use MPSGraph (bf16 matmul, fused SDPA on contiguous
-  copies of q/k/v). In MPS builds only the FLUX.2 / FLUX.3 transformers use
-  it: the Qwen3 and VAE device paths are compiled out (QWEN3_DEV / VAE_DEV).
+  copies of q/k/v). In MPS builds only the transformers use it: the Qwen3
+  and VAE device paths are compiled out (QWEN3_DEV / VAE_DEV).
 
 Known pitfalls:
 1. rocBLAS has only fallback (slow) bf16 -> f32 GEMM kernels on gfx1151:

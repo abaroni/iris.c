@@ -14,6 +14,7 @@ Supported model families:
   - Runs fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
 - **[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)** (by Tongyi-MAI):
   - **6B** (8 NFE / 9 scheduler steps, no CFG, fast).
+  - Runs fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
 - **[FLUX.3 Image Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein)** (by [Black Forest Labs](https://bfl.ai/)):
   - **5.6B distilled** (16 steps by default, trained for 4 to 16, no CFG. FLUX Kommunity License).
   - **5.6B base** (50 steps, CFG. FLUX Kommunity License).
@@ -25,8 +26,8 @@ Supported model families:
 ```bash
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
-# or: make cuda    # NVIDIA GPU (FLUX.2, FLUX.3)
-# or: make rocm    # AMD GPU (FLUX.2, FLUX.3)
+# or: make cuda    # NVIDIA GPU
+# or: make rocm    # AMD GPU
 # or: make blas    # Intel Mac / Linux with OpenBLAS
 # or: make generic # Pure C, no dependencies
 
@@ -296,15 +297,14 @@ make rocm       # AMD GPU (needs ROCm, with hipBLAS)
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
-- Linux with an NVIDIA / AMD GPU, for FLUX.2 / FLUX.3: `make cuda` / `make rocm`
+- Linux with an NVIDIA / AMD GPU: `make cuda` / `make rocm`
 - Linux with OpenBLAS: `make blas`
 - Linux without OpenBLAS: `make generic`
 
-The CUDA and ROCm backends run the whole FLUX.2 and FLUX.3 pipelines on
-the GPU (text encoder, transformer, VAE), in bf16 with f32 accumulation.
-Z-Image uses the GPU for the text encoder and the VAE but runs its
-transformer on the CPU in these builds: add `OPENBLAS=1` to use OpenBLAS
-for the CPU work. The build targets the GPU of the machine it runs on; set
+The CUDA and ROCm backends run the whole pipeline of every model on the
+GPU (text encoder, transformer, VAE), in bf16 with f32 accumulation. Add
+`OPENBLAS=1` to use OpenBLAS for the CPU fallback (used when the GPU runs
+out of memory). The build targets the GPU of the machine it runs on; set
 `GPU_ARCH` (e.g. `GPU_ARCH=sm_121` or `GPU_ARCH=gfx1151`) to build for
 another one, and `CUDA_HOME` / `ROCM_HOME` for non-standard install paths.
 
@@ -426,12 +426,16 @@ loading:
 
 | Size | Apple M5 Max (MPS) | NVIDIA GB10 (CUDA) | AMD Strix Halo, Radeon 8060S (ROCm) |
 |------|--------------------|--------------------|--------------------------------------|
-| 256x256 | 3.4s | 4.3s | 5.7s |
-| 512x512 | 5.3s | 5.6s | 11.8s |
-| 1024x1024 | 16.2s | 13.8s | 39.4s |
+| 256x256 | 3.4s | 4.8s | 5.8s |
+| 512x512 | 5.3s | 6.2s | 9.7s |
+| 1024x1024 | 16.2s | 14.0s | 31.9s |
 
 FLUX.2 Klein 4B distilled, 4 steps, 1024x1024, wall clock including model
-loading: Apple M5 Max 6.2s, NVIDIA GB10 6.1s, AMD Strix Halo 9.6s.
+loading: Apple M5 Max 6.2s, NVIDIA GB10 6.1s, AMD Strix Halo 9.1s.
+Z-Image-Turbo, 8 NFE, 1024x1024: Apple M5 Max 16.1s, NVIDIA GB10 13.0s, AMD Strix Halo
+23.3s.
+
+Most of the time at small sizes is model loading (uploading the weights).
 
 ### Community Benchmarks
 
