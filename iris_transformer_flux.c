@@ -16,6 +16,9 @@
 #include "iris.h"
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
+#ifdef IRIS_DEV
+#include "iris_dev.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -211,6 +214,10 @@ typedef struct {
 
 /* Full transformer context */
 typedef struct iris_transformer_flux {
+#ifdef IRIS_DEV
+    struct dev_flux *dev;
+#endif
+
     /* Configuration */
     int hidden_size;        /* 3072 */
     int num_heads;          /* 24 */
@@ -3470,6 +3477,396 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     /* No free - using pre-allocated buffers */
 }
 
+typedef struct {
+    const float *latent;
+    int h, w;
+    int t_offset;
+} iris_ref_t;
+
+#ifdef IRIS_DEV
+/* ========================================================================
+ * GPU Forward (CUDA / ROCm / Metal)
+ * ======================================================================== */
+
+typedef struct {
+    uint16_t *qkv, *proj, *ff_in, *ff_out;
+    float *norm_q, *norm_k;
+} dev_stream_flux_t;
+
+typedef struct {
+    uint16_t *w_in, *w_out;
+    float *norm_q, *norm_k;
+} dev_single_flux_t;
+
+struct dev_flux {
+    dev_stream_flux_t *streams;  /* [double_layers, 2]: text, image */
+    dev_single_flux_t *single;
+    uint16_t *img_in, *txt_in, *t_lin1, *t_lin2;
+    uint16_t *mod_txt, *mod_img, *mod_single, *mod_final, *proj_final;
+    float *vec;                 /* sinusoidal, hidden, temb, txt/img/single/final mods */
+    uint16_t *vec_bf16;         /* sinusoidal and timestep MLP scratch */
+
+    int seq;
+    float *x, *out;             /* f32 residual and projected output */
+    uint16_t *norm, *h, *cat;
+    float *rope_cos, *rope_sin; /* [seq, head_dim/2] */
+    size_t in_elems;
+    float *in_f32;
+    uint16_t *in_bf16;
+};
+
+/* Assemble vertical concatenations directly from the mmapped bf16 tensors. */
+static uint16_t *dev_rows_flux(const uint16_t *const *parts, const size_t *counts, int n) {
+    size_t total = 0;
+    for (int i = 0; i < n; i++) {
+        if (!parts[i]) return NULL;
+        total += counts[i];
+    }
+    uint16_t *out = iris_dev_alloc(total * sizeof(uint16_t));
+    if (!out) return NULL;
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        iris_dev_upload(out + off, parts[i], counts[i] * sizeof(uint16_t));
+        off += counts[i];
+    }
+    return out;
+}
+
+static float *dev_f32_flux(const float *src, size_t n) {
+    if (!src) return NULL;
+    float *out = iris_dev_alloc(n * sizeof(float));
+    if (out) iris_dev_upload(out, src, n * sizeof(float));
+    return out;
+}
+
+static uint16_t *dev_weight_flux(iris_transformer_flux_t *tf, const char *name, size_t n) {
+    const uint16_t *p = mmap_get_bf16(tf->sf_files, tf->num_sf_files, name);
+    return dev_rows_flux(&p, &n, 1);
+}
+
+static int dev_load_stream_flux(dev_stream_flux_t *s, const uint16_t *q,
+                                const uint16_t *k, const uint16_t *v,
+                                const uint16_t *proj, const uint16_t *gate,
+                                const uint16_t *up, const uint16_t *down,
+                                const float *nq, const float *nk,
+                                int dim, int mlp, int hd) {
+    size_t dd = (size_t)dim * dim, md = (size_t)mlp * dim;
+    const uint16_t *qkv[] = {q, k, v}, *ff[] = {gate, up};
+    size_t qkv_n[] = {dd, dd, dd}, ff_n[] = {md, md};
+    s->qkv = dev_rows_flux(qkv, qkv_n, 3);
+    s->proj = dev_rows_flux(&proj, &dd, 1);
+    s->ff_in = dev_rows_flux(ff, ff_n, 2);
+    s->ff_out = dev_rows_flux(&down, &md, 1);
+    s->norm_q = dev_f32_flux(nq, hd);
+    s->norm_k = dev_f32_flux(nk, hd);
+    return s->qkv && s->proj && s->ff_in && s->ff_out && s->norm_q && s->norm_k;
+}
+
+static void dev_free_activations_flux(struct dev_flux *d) {
+    iris_dev_free(d->x); d->x = NULL;
+    iris_dev_free(d->out); d->out = NULL;
+    iris_dev_free(d->norm); d->norm = NULL;
+    iris_dev_free(d->h); d->h = NULL;
+    iris_dev_free(d->cat); d->cat = NULL;
+    iris_dev_free(d->rope_cos); d->rope_cos = NULL;
+    iris_dev_free(d->rope_sin); d->rope_sin = NULL;
+    d->seq = 0;
+}
+
+static void dev_free_flux(iris_transformer_flux_t *tf) {
+    struct dev_flux *d = tf->dev;
+    if (!d) return;
+    if (d->streams) {
+        for (int i = 0; i < 2 * tf->num_double_layers; i++) {
+            dev_stream_flux_t *s = &d->streams[i];
+            iris_dev_free(s->qkv);
+            iris_dev_free(s->proj);
+            iris_dev_free(s->ff_in);
+            iris_dev_free(s->ff_out);
+            iris_dev_free(s->norm_q);
+            iris_dev_free(s->norm_k);
+        }
+        free(d->streams);
+    }
+    if (d->single) {
+        for (int i = 0; i < tf->num_single_layers; i++) {
+            iris_dev_free(d->single[i].w_in);
+            iris_dev_free(d->single[i].w_out);
+            iris_dev_free(d->single[i].norm_q);
+            iris_dev_free(d->single[i].norm_k);
+        }
+        free(d->single);
+    }
+    iris_dev_free(d->img_in);
+    iris_dev_free(d->txt_in);
+    iris_dev_free(d->t_lin1);
+    iris_dev_free(d->t_lin2);
+    iris_dev_free(d->mod_txt);
+    iris_dev_free(d->mod_img);
+    iris_dev_free(d->mod_single);
+    iris_dev_free(d->mod_final);
+    iris_dev_free(d->proj_final);
+    iris_dev_free(d->vec);
+    iris_dev_free(d->vec_bf16);
+    dev_free_activations_flux(d);
+    iris_dev_free(d->in_f32);
+    iris_dev_free(d->in_bf16);
+    free(d);
+    tf->dev = NULL;
+}
+
+static int dev_load_flux(iris_transformer_flux_t *tf) {
+    struct dev_flux *d = calloc(1, sizeof(*d));
+    tf->dev = d;
+    if (!d) goto fail;
+    size_t dim = tf->hidden_size, mlp = tf->mlp_hidden;
+    int tc = tf->time_embed.sincos_dim;
+    d->img_in = dev_weight_flux(tf, "x_embedder.weight", dim * tf->latent_channels);
+    d->txt_in = dev_weight_flux(tf, "context_embedder.weight", dim * tf->text_dim);
+    d->t_lin1 = dev_weight_flux(tf, "time_guidance_embed.timestep_embedder.linear_1.weight", dim * tc);
+    d->t_lin2 = dev_weight_flux(tf, "time_guidance_embed.timestep_embedder.linear_2.weight", dim * dim);
+    d->mod_txt = dev_weight_flux(tf, "double_stream_modulation_txt.linear.weight", 6 * dim * dim);
+    d->mod_img = dev_weight_flux(tf, "double_stream_modulation_img.linear.weight", 6 * dim * dim);
+    d->mod_single = dev_weight_flux(tf, "single_stream_modulation.linear.weight", 3 * dim * dim);
+    d->mod_final = dev_weight_flux(tf, "norm_out.linear.weight", 2 * dim * dim);
+    d->proj_final = dev_weight_flux(tf, "proj_out.weight", tf->latent_channels * dim);
+    if (!d->img_in || !d->txt_in || !d->t_lin1 || !d->t_lin2 || !d->mod_txt ||
+        !d->mod_img || !d->mod_single || !d->mod_final || !d->proj_final) goto fail;
+
+    d->streams = calloc(2 * tf->num_double_layers, sizeof(*d->streams));
+    d->single = calloc(tf->num_single_layers, sizeof(*d->single));
+    if ((!d->streams && tf->num_double_layers) || (!d->single && tf->num_single_layers)) goto fail;
+    for (int i = 0; i < tf->num_double_layers; i++) {
+        double_block_t b = {0};
+        load_double_block_weights(&b, tf->sf_files, tf->num_sf_files, i, dim, mlp, 1);
+        int ok = dev_load_stream_flux(&d->streams[2*i],
+            b.txt_q_weight_bf16, b.txt_k_weight_bf16, b.txt_v_weight_bf16,
+            b.txt_proj_weight_bf16, b.txt_mlp_gate_weight_bf16, b.txt_mlp_up_weight_bf16,
+            b.txt_mlp_down_weight_bf16, b.txt_norm_q_weight, b.txt_norm_k_weight,
+            dim, mlp, tf->head_dim);
+        if (ok) ok = dev_load_stream_flux(&d->streams[2*i+1],
+            b.img_q_weight_bf16, b.img_k_weight_bf16, b.img_v_weight_bf16,
+            b.img_proj_weight_bf16, b.img_mlp_gate_weight_bf16, b.img_mlp_up_weight_bf16,
+            b.img_mlp_down_weight_bf16, b.img_norm_q_weight, b.img_norm_k_weight,
+            dim, mlp, tf->head_dim);
+        free_double_block_weights(&b);
+        if (!ok) goto fail;
+    }
+    for (int i = 0; i < tf->num_single_layers; i++) {
+        single_block_t b = {0};
+        load_single_block_weights(&b, tf->sf_files, tf->num_sf_files, i, dim, mlp, 1);
+        dev_single_flux_t *s = &d->single[i];
+        const uint16_t *in = b.qkv_mlp_weight_bf16, *out = b.proj_mlp_weight_bf16;
+        size_t ni = (3 * dim + 2 * mlp) * dim, no = dim * (dim + mlp);
+        s->w_in = dev_rows_flux(&in, &ni, 1);
+        s->w_out = dev_rows_flux(&out, &no, 1);
+        s->norm_q = dev_f32_flux(b.norm_q_weight, tf->head_dim);
+        s->norm_k = dev_f32_flux(b.norm_k_weight, tf->head_dim);
+        free_single_block_weights(&b);
+        if (!s->w_in || !s->w_out || !s->norm_q || !s->norm_k) goto fail;
+    }
+    d->vec = iris_dev_alloc((tc + 19 * dim) * sizeof(float));
+    d->vec_bf16 = iris_dev_alloc((tc + dim) * sizeof(uint16_t));
+    if (!d->vec || !d->vec_bf16) goto fail;
+    iris_dev_sync();
+    return 1;
+fail:
+    fprintf(stderr, "FLUX.2: GPU weight upload failed, using the CPU\n");
+    dev_free_flux(tf);
+    return 0;
+}
+
+static int dev_ensure_flux(iris_transformer_flux_t *tf, int seq, size_t in_elems) {
+    struct dev_flux *d = tf->dev;
+    size_t dim = tf->hidden_size, mlp = tf->mlp_hidden, half = tf->head_dim / 2;
+    if (seq > d->seq) {
+        dev_free_activations_flux(d);
+        d->x = iris_dev_alloc((size_t)seq * dim * sizeof(float));
+        size_t out_dim = dim > (size_t)tf->latent_channels ? dim : (size_t)tf->latent_channels;
+        d->out = iris_dev_alloc((size_t)seq * out_dim * sizeof(float));
+        d->norm = iris_dev_alloc((size_t)seq * dim * sizeof(uint16_t));
+        d->h = iris_dev_alloc((size_t)seq * (3 * dim + 2 * mlp) * sizeof(uint16_t));
+        d->cat = iris_dev_alloc((size_t)seq * (dim + mlp) * sizeof(uint16_t));
+        d->rope_cos = iris_dev_alloc((size_t)seq * half * sizeof(float));
+        d->rope_sin = iris_dev_alloc((size_t)seq * half * sizeof(float));
+        if (!d->x || !d->out || !d->norm || !d->h || !d->cat || !d->rope_cos || !d->rope_sin) return 0;
+        d->seq = seq;
+    }
+    if (in_elems > d->in_elems) {
+        iris_dev_free(d->in_f32);
+        iris_dev_free(d->in_bf16);
+        d->in_f32 = iris_dev_alloc(in_elems * sizeof(float));
+        d->in_bf16 = iris_dev_alloc(in_elems * sizeof(uint16_t));
+        if (!d->in_f32 || !d->in_bf16) return 0;
+        d->in_elems = in_elems;
+    }
+    return 1;
+}
+
+static void dev_embed_flux(iris_transformer_flux_t *tf, float *out, const float *in,
+                            const uint16_t *w, int seq, int channels) {
+    struct dev_flux *d = tf->dev;
+    size_t n = (size_t)seq * channels;
+    iris_dev_upload(d->in_f32, in, n * sizeof(float));
+    iris_dev_f32_to_bf16(d->in_bf16, d->in_f32, n);
+    iris_dev_linear_f32(out, d->in_bf16, w, seq, channels, tf->hidden_size);
+}
+
+/* All three public entry points share the same [TEXT, IMAGE, REFS] layout. */
+static float *forward_dev_flux(iris_transformer_flux_t *tf,
+                               const float *img, int img_h, int img_w,
+                               const iris_ref_t *refs, int num_refs,
+                               const float *txt, int txt_seq, float timestep) {
+    struct dev_flux *d = tf->dev;
+    int dim = tf->hidden_size, mlp = tf->mlp_hidden, hd = tf->head_dim, half = hd / 2;
+    int channels = tf->latent_channels, img_seq = img_h * img_w, images = img_seq;
+    for (int r = 0; r < num_refs; r++) images += refs[r].h * refs[r].w;
+    int seq = txt_seq + images;
+    size_t in_elems = (size_t)images * channels;
+    if (in_elems < (size_t)txt_seq * tf->text_dim) in_elems = (size_t)txt_seq * tf->text_dim;
+    if (!dev_ensure_flux(tf, seq, in_elems)) goto fail;
+
+    /* Host layout conversion and the exact CPU RoPE tables, compacted to pairs. */
+    float *tokens = malloc((size_t)images * channels * sizeof(float));
+    float *cos = malloc((size_t)seq * hd * sizeof(float));
+    float *sin = malloc((size_t)seq * hd * sizeof(float));
+    float *output = malloc((size_t)img_seq * channels * sizeof(float));
+    if (!tokens || !cos || !sin || !output) {
+        free(tokens); free(cos); free(sin); free(output);
+        goto fail;
+    }
+    compute_rope_text(cos, sin, txt_seq, tf->axis_dim, tf->rope_theta);
+    compute_rope_2d(cos + (size_t)txt_seq * hd, sin + (size_t)txt_seq * hd,
+                    img_h, img_w, tf->axis_dim, tf->rope_theta);
+    int off = 0;
+    for (int r = -1; r < num_refs; r++) {
+        const float *src = r < 0 ? img : refs[r].latent;
+        int n = r < 0 ? img_seq : refs[r].h * refs[r].w;
+        for (int s = 0; s < n; s++)
+            for (int c = 0; c < channels; c++)
+                tokens[(size_t)(off + s) * channels + c] = src[(size_t)c * n + s];
+        if (r >= 0)
+            compute_rope_2d_with_t_offset(cos + (size_t)(txt_seq + off) * hd,
+                sin + (size_t)(txt_seq + off) * hd, refs[r].h, refs[r].w,
+                tf->axis_dim, tf->rope_theta, refs[r].t_offset);
+        off += n;
+    }
+    for (size_t i = 0; i < (size_t)seq * half; i++) {
+        cos[i] = cos[2*i];
+        sin[i] = sin[2*i];
+    }
+    iris_dev_upload(d->rope_cos, cos, (size_t)seq * half * sizeof(float));
+    iris_dev_upload(d->rope_sin, sin, (size_t)seq * half * sizeof(float));
+    free(cos); free(sin);
+    dev_embed_flux(tf, d->x, txt, d->txt_in, txt_seq, tf->text_dim);
+    dev_embed_flux(tf, d->x + (size_t)txt_seq * dim, tokens, d->img_in, images, channels);
+
+    int tc = tf->time_embed.sincos_dim;
+    float sin_emb[256];
+    get_timestep_embedding(sin_emb, timestep * 1000.0f, tc, 10000.0f);
+    iris_dev_upload(d->vec, sin_emb, tc * sizeof(float));
+    iris_dev_f32_to_bf16(d->vec_bf16, d->vec, tc);
+    float *hidden = d->vec + tc, *temb = hidden + dim;
+    float *mod_txt = temb + dim, *mod_img = mod_txt + 6 * dim;
+    float *mod_single = mod_img + 6 * dim, *fin = mod_single + 3 * dim;
+    uint16_t *act = d->vec_bf16 + tc;
+    iris_dev_linear_f32(hidden, d->vec_bf16, d->t_lin1, 1, tc, dim);
+    iris_dev_silu(hidden, dim);
+    iris_dev_f32_to_bf16(act, hidden, dim);
+    iris_dev_linear_f32(temb, act, d->t_lin2, 1, dim, dim);
+    iris_dev_silu(temb, dim);
+    iris_dev_f32_to_bf16(act, temb, dim);
+    iris_dev_linear_f32(mod_txt, act, d->mod_txt, 1, dim, 6 * dim);
+    iris_dev_linear_f32(mod_img, act, d->mod_img, 1, dim, 6 * dim);
+    iris_dev_linear_f32(mod_single, act, d->mod_single, 1, dim, 3 * dim);
+    iris_dev_linear_f32(fin, act, d->mod_final, 1, dim, 2 * dim);
+    iris_dev_sync();
+    double start = tf_get_time_ms();
+
+    for (int l = 0; l < tf->num_double_layers; l++) {
+        /* Two QKV GEMMs write contiguous rows of the joint attention input. */
+        for (int m = 0; m < 2; m++) {
+            dev_stream_flux_t *b = &d->streams[2*l + m];
+            int n = m ? images : txt_seq, first = m ? txt_seq : 0;
+            size_t xoff = (size_t)first * dim;
+            float *mod = m ? mod_img : mod_txt;
+            uint16_t *qkv = d->h + 3 * xoff;
+            iris_dev_layer_norm_mod(d->norm, d->x + xoff, mod, mod + dim, n, dim, 1e-6f);
+            iris_dev_linear_bf16(qkv, d->norm, b->qkv, n, dim, 3 * dim);
+            iris_dev_head_norm_rope(qkv, 3 * dim, b->norm_q,
+                d->rope_cos + (size_t)first * half, d->rope_sin + (size_t)first * half,
+                n, tf->num_heads, hd, 1e-6f, 0);
+            iris_dev_head_norm_rope(qkv + dim, 3 * dim, b->norm_k,
+                d->rope_cos + (size_t)first * half, d->rope_sin + (size_t)first * half,
+                n, tf->num_heads, hd, 1e-6f, 0);
+        }
+        iris_dev_attention(d->cat, dim, d->h, d->h + dim, d->h + 2 * dim, 3 * dim,
+            seq, seq, tf->num_heads, tf->num_heads, hd, 1.0f / sqrtf(hd), 0, NULL);
+        /* Attention residual must precede the separately normalized FFN. */
+        for (int m = 0; m < 2; m++) {
+            dev_stream_flux_t *b = &d->streams[2*l + m];
+            int n = m ? images : txt_seq, first = m ? txt_seq : 0;
+            size_t xoff = (size_t)first * dim;
+            float *mod = m ? mod_img : mod_txt;
+            iris_dev_linear_f32(d->out, d->cat + xoff, b->proj, n, dim, dim);
+            iris_dev_residual(d->x + xoff, d->out, mod + 2 * dim, n, dim);
+        }
+        for (int m = 0; m < 2; m++) {
+            dev_stream_flux_t *b = &d->streams[2*l + m];
+            int n = m ? images : txt_seq, first = m ? txt_seq : 0;
+            float *x = d->x + (size_t)first * dim, *mod = m ? mod_img : mod_txt;
+            iris_dev_layer_norm_mod(d->norm, x, mod + 3 * dim, mod + 4 * dim, n, dim, 1e-6f);
+            iris_dev_linear_bf16(d->h, d->norm, b->ff_in, n, dim, 2 * mlp);
+            iris_dev_swiglu(d->cat, mlp, d->h, d->h + mlp, 2 * mlp, n, mlp);
+            iris_dev_linear_f32(d->out, d->cat, b->ff_out, n, mlp, dim);
+            iris_dev_residual(x, d->out, mod + 5 * dim, n, dim);
+        }
+        if (iris_substep_callback) iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, l, tf->num_double_layers);
+    }
+    iris_dev_sync();
+    double double_time = tf_get_time_ms() - start;
+    start = tf_get_time_ms();
+    for (int l = 0; l < tf->num_single_layers; l++) {
+        dev_single_flux_t *b = &d->single[l];
+        int ldh = 3 * dim + 2 * mlp, ldc = dim + mlp;
+        iris_dev_layer_norm_mod(d->norm, d->x, mod_single, mod_single + dim, seq, dim, 1e-6f);
+        iris_dev_linear_bf16(d->h, d->norm, b->w_in, seq, dim, ldh);
+        iris_dev_head_norm_rope(d->h, ldh, b->norm_q, d->rope_cos, d->rope_sin,
+            seq, tf->num_heads, hd, 1e-6f, 0);
+        iris_dev_head_norm_rope(d->h + dim, ldh, b->norm_k, d->rope_cos, d->rope_sin,
+            seq, tf->num_heads, hd, 1e-6f, 0);
+        iris_dev_attention(d->cat, ldc, d->h, d->h + dim, d->h + 2 * dim, ldh,
+            seq, seq, tf->num_heads, tf->num_heads, hd, 1.0f / sqrtf(hd), 0, NULL);
+        iris_dev_swiglu(d->cat + dim, ldc, d->h + 3 * dim, d->h + 3 * dim + mlp, ldh, seq, mlp);
+        iris_dev_linear_f32(d->out, d->cat, b->w_out, seq, ldc, dim);
+        iris_dev_residual(d->x, d->out, mod_single + 2 * dim, seq, dim);
+        if (iris_substep_callback) iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, l, tf->num_single_layers);
+    }
+    iris_dev_sync();
+    double single_time = tf_get_time_ms() - start;
+    start = tf_get_time_ms();
+    /* Final modulation is (scale, shift); only target image rows reach output. */
+    iris_dev_layer_norm_mod(d->norm, d->x + (size_t)txt_seq * dim, fin + dim, fin, img_seq, dim, 1e-6f);
+    iris_dev_linear_f32(d->out, d->norm, d->proj_final, img_seq, dim, channels);
+    iris_dev_download(tokens, d->out, (size_t)img_seq * channels * sizeof(float));
+    for (int s = 0; s < img_seq; s++)
+        for (int c = 0; c < channels; c++)
+            output[(size_t)c * img_seq + s] = tokens[(size_t)s * channels + c];
+    free(tokens);
+    double final_time = tf_get_time_ms() - start;
+    iris_timing_transformer_double += double_time;
+    iris_timing_transformer_single += single_time;
+    iris_timing_transformer_final += final_time;
+    iris_timing_transformer_total += double_time + single_time + final_time;
+    if (iris_substep_callback) iris_substep_callback(IRIS_SUBSTEP_FINAL_LAYER, 0, 1);
+    return output;
+fail:
+    fprintf(stderr, "FLUX.2: GPU workspace allocation failed, using the CPU\n");
+    dev_free_flux(tf);
+    return NULL;
+}
+#endif /* IRIS_DEV */
+
 /* ========================================================================
  * Full Transformer Forward Pass
  * ======================================================================== */
@@ -3483,6 +3880,13 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                                 const float *img_latent, int img_h, int img_w,
                                 const float *txt_emb, int txt_seq,
                                 float timestep) {
+#ifdef IRIS_DEV
+    if (tf->dev) {
+        float *out = forward_dev_flux(tf, img_latent, img_h, img_w, NULL, 0,
+                                       txt_emb, txt_seq, timestep);
+        if (out) return out;
+    }
+#endif
     int hidden = tf->hidden_size;
     int img_seq = img_h * img_w;
 
@@ -3975,6 +4379,14 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
                                         txt_emb, txt_seq, timestep);
     }
 
+#ifdef IRIS_DEV
+    if (tf->dev) {
+        iris_ref_t ref = {ref_latent, ref_h, ref_w, t_offset};
+        float *out = forward_dev_flux(tf, img_latent, img_h, img_w, &ref, 1,
+                                       txt_emb, txt_seq, timestep);
+        if (out) return out;
+    }
+#endif
     int hidden = tf->hidden_size;
     int img_seq = img_h * img_w;
     int ref_seq = ref_h * ref_w;
@@ -4163,12 +4575,6 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
  * Transformer Forward with Multiple Reference Images
  * ======================================================================== */
 
-typedef struct {
-    const float *latent;
-    int h, w;
-    int t_offset;
-} iris_ref_t;
-
 /*
  * Extended transformer forward that accepts multiple reference images.
  * Each reference gets a different T offset in RoPE positioning.
@@ -4192,6 +4598,13 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
                                                   txt_emb, txt_seq, timestep);
     }
 
+#ifdef IRIS_DEV
+    if (tf->dev) {
+        float *out = forward_dev_flux(tf, img_latent, img_h, img_w, refs, num_refs,
+                                       txt_emb, txt_seq, timestep);
+        if (out) return out;
+    }
+#endif
     int hidden = tf->hidden_size;
     int img_seq = img_h * img_w;
     int axis_dim = 32;
@@ -4549,6 +4962,9 @@ error:
 
 void iris_transformer_free_flux(iris_transformer_flux_t *tf) {
     if (!tf) return;
+#ifdef IRIS_DEV
+    dev_free_flux(tf);
+#endif
 
     /* In mmap mode, bf16 pointers point into the mmap'd file region and must
      * NOT be freed. Clean up any cached block weights first, then only NULL
@@ -4782,7 +5198,15 @@ static void warmup_bf16_weights(iris_transformer_flux_t *tf) {
 }
 #endif /* USE_METAL */
 
+#ifdef IRIS_DEV
+iris_transformer_flux_t *iris_transformer_load_safetensors_mmap_flux(const char *model_dir);
+#endif
+
 iris_transformer_flux_t *iris_transformer_load_safetensors_flux(const char *model_dir) {
+#ifdef IRIS_DEV
+    /* Keep the mmaps for device upload and on-demand CPU fallback. */
+    if (iris_dev_available()) return iris_transformer_load_safetensors_mmap_flux(model_dir);
+#endif
     iris_transformer_flux_t *tf = calloc(1, sizeof(iris_transformer_flux_t));
     if (!tf) return NULL;
 
@@ -5165,11 +5589,16 @@ iris_transformer_flux_t *iris_transformer_load_safetensors_mmap_flux(const char 
         return NULL;
     }
 
+#ifdef IRIS_DEV
+    if (iris_dev_available()) dev_load_flux(tf);
+#endif
+
 #ifdef USE_METAL
     /* Pre-warm bf16 weight buffer cache: copy all block weights from mmap
      * to Metal GPU buffers. This shifts ~1s of first-step overhead to model
-     * loading, making all denoising steps consistently fast. */
-    warmup_mmap_bf16_buffers(tf);
+     * loading, making all denoising steps consistently fast. Not needed
+     * when the device forward owns its own copy of the weights. */
+    if (!tf->dev) warmup_mmap_bf16_buffers(tf);
 #endif
 
     return tf;

@@ -216,7 +216,7 @@ iris.o: iris.c iris.h iris_kernels.h iris_safetensors.h iris_qwen3.h
 iris_kernels.o: iris_kernels.c iris_kernels.h
 iris_tokenizer.o: iris_tokenizer.c iris.h
 iris_vae.o: iris_vae.c iris.h iris_kernels.h
-iris_transformer_flux.o: iris_transformer_flux.c iris.h iris_kernels.h
+iris_transformer_flux.o: iris_transformer_flux.c iris.h iris_kernels.h iris_safetensors.h iris_dev.h
 iris_transformer_zimage.o: iris_transformer_zimage.c iris.h iris_kernels.h iris_safetensors.h
 iris_transformer_flux3.o: iris_transformer_flux3.c iris.h iris_kernels.h iris_safetensors.h iris_dev.h
 iris_sample.o: iris_sample.c iris.h iris_kernels.h

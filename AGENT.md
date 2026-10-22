@@ -77,11 +77,11 @@ main.c                    - CLI entry point
 # Build Targets
 
 This project implements five targets:
-- MPS: Apple Silicon GPU path. FLUX.3's transformer uses iris_dev.h
+- MPS: Apple Silicon GPU path. The FLUX.2 / FLUX.3 transformers use iris_dev.h
   (iris_dev_metal.m); the rest uses iris_metal.m.
 - CUDA / ROCm: NVIDIA / AMD GPU path (iris_dev.h, implemented by iris_cuda.cu,
-  one source for nvcc and hipcc). Currently FLUX.3 transformer, Qwen3 text
-  encoder and VAE decoder; FLUX.2 / Z-Image transformers run on the CPU there.
+  one source for nvcc and hipcc). FLUX.2 / FLUX.3 transformers, Qwen3 text
+  encoder and VAE; the Z-Image transformer runs on the CPU there.
 - BLAS: optimized CPU inference via BLAS/OpenBLAS.
 - generic: pure C fallback, very slow.
 
@@ -462,8 +462,8 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
   MTLBuffers, mapped back to (buffer, offset) by a sorted allocation table.
   Work goes into one command buffer, committed by sync/download/upload/free.
   GEMMs and attention use MPSGraph (bf16 matmul, fused SDPA on contiguous
-  copies of q/k/v). In MPS builds only FLUX.3's transformer uses it: the
-  Qwen3 and VAE device paths are compiled out (QWEN3_DEV / VAE_DEV).
+  copies of q/k/v). In MPS builds only the FLUX.2 / FLUX.3 transformers use
+  it: the Qwen3 and VAE device paths are compiled out (QWEN3_DEV / VAE_DEV).
 
 Known pitfalls:
 1. rocBLAS has only fallback (slow) bf16 -> f32 GEMM kernels on gfx1151:
