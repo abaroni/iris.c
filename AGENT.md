@@ -56,6 +56,8 @@ iris_vae.c                - VAE encoder/decoder
 iris_kernels.c            - CPU kernels (softmax, RMSNorm, etc.)
 iris_metal.m              - Metal GPU acceleration runtime
 iris_metal.h              - Metal/GPU API surface
+iris_dev.h                - Device (CUDA / ROCm) compute API
+iris_cuda.cu              - CUDA / ROCm (HIP) implementation of iris_dev.h
 iris_shaders.metal        - Metal compute kernels
 iris_safetensors.c        - Weight loading
 iris_image.c              - Image I/O (PNG/PPM/JPEG)
@@ -70,14 +72,18 @@ main.c                    - CLI entry point
 
 # Build Targets
 
-This project implements three targets:
+This project implements five targets:
 - MPS: Apple Silicon GPU path.
+- CUDA / ROCm: NVIDIA / AMD GPU path (iris_dev.h, implemented by iris_cuda.cu,
+  one source for nvcc and hipcc). Currently FLUX.3 transformer, Qwen3 text
+  encoder and VAE decoder; FLUX.2 / Z-Image transformers run on the CPU there.
 - BLAS: optimized CPU inference via BLAS/OpenBLAS.
 - generic: pure C fallback, very slow.
 
 # Development Rules
 
-- No additional project dependencies. Acceptable external deps are BLAS/OpenBLAS and Metal/MPS from macOS.
+- No additional project dependencies. Acceptable external deps are BLAS/OpenBLAS, Metal/MPS from macOS,
+  and for the GPU builds the CUDA toolkit (runtime, cuBLAS) or ROCm (HIP runtime, hipBLAS).
 - Reject tiny speed gains that add complexity; prefer substantial wins.
 - Always test code modifications with `make test`.
 - Once changes are validated, commit them.
@@ -432,6 +438,30 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
    prompt, so they must not go through the pointer-keyed rope buffer cache.
 4. **Metal weight cache keys**: on MPS builds, Flux3 linears pass the mmapped
    bf16 weight pointers; a reused f32 conversion scratch would be served stale.
+
+# CUDA / ROCm Backend
+
+- iris_dev.h is a small API for GPU-resident inference: plain device pointers,
+  bf16 stored as uint16_t, one stream (iris_dev_download()/sync() wait).
+  iris_cuda.cu maps the few CUDA/HIP runtime and cuBLAS/hipBLAS names that
+  differ, so the same source builds with nvcc or hipcc (-DIRIS_HIP).
+- Models own their device weights (uploaded explicitly at load / first use).
+  Never key device data on host pointers (see the Metal pitfalls above).
+- GEMMs: bf16 inputs, f32 accumulation. Fused weights are assembled on the
+  device with iris_dev_upload()/iris_dev_upload_2d().
+- Attention: flash kernels for head_dim 128, unmasked (CUDA: mma.sync +
+  cp.async + ldmatrix; ROCm: gfx11 WMMA, computing transposed products so each
+  lane owns a query). Other cases use batched GEMMs around a softmax.
+- Uploads: CUDA goes through pinned staging buffers.
+
+Known pitfalls:
+1. rocBLAS has only fallback (slow) bf16 -> f32 GEMM kernels on gfx1151:
+   iris_dev_linear_f32() computes bf16 and widens it on HIP.
+2. On a GB10, pageable copies from mmapped files run at 0.5-3 GB/s, and GPU
+   reads of pageable memory (ATS) are slow for one-pass copies: use the pinned
+   staging path. GEMMs can read host memory fine, but uploads must not rely on it.
+3. RDNA3 WMMA: A/B operands hold a row/column per lane (replicated in both
+   half-waves); the accumulator holds column lane%16, rows 2e + lane/16.
 
 # Test Commands
 

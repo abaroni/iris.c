@@ -21,7 +21,9 @@
  *   (0, 0, 0, index) and reference i at (0, row/2, col/2, -(i+1)).
  *
  * Weights stay as bf16 in the mmapped safetensors files. The CPU path
- * converts each matrix to f32 right before its matmul.
+ * converts each matrix to f32 right before its matmul. With a device
+ * backend (CUDA / ROCm, see iris_dev.h) the weights are uploaded once and
+ * the whole forward pass runs on the GPU.
  */
 
 #include "iris.h"
@@ -31,6 +33,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+#ifdef IRIS_DEV
+#include "iris_dev.h"
+#endif
 
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -97,6 +103,9 @@ typedef struct iris_transformer_flux3 {
 
     safetensors_file_t *sf[F3_MAX_SHARDS];
     int num_sf;
+
+    /* Device copy of the model (GPU path), NULL when running on the CPU */
+    struct f3_dev *dev;
 
     /* CPU work memory, grown on demand */
     float *wbuf;            /* f32 copy of the current weight matrix */
@@ -300,6 +309,29 @@ static void image_positions(float (*pos)[F3_ROPE_AXES], int h, int w, float l_co
     }
 }
 
+/* RoPE tables [total, head_dim/2] for the joint sequence [TXT, IMG, REFS]
+ * (caller frees). */
+static void joint_rope(iris_transformer_flux3_t *tf, int txt_seq, int img_h, int img_w,
+                       const int *ref_h, const int *ref_w, int num_refs,
+                       float **rope_cos, float **rope_sin) {
+    int total = txt_seq + img_h * img_w;
+    for (int i = 0; i < num_refs; i++) total += ref_h[i] * ref_w[i];
+    int half = tf->head_dim / 2;
+
+    float (*pos)[F3_ROPE_AXES] = calloc(total, sizeof(*pos));
+    for (int s = 0; s < txt_seq; s++) pos[s][3] = (float)s;
+    image_positions(pos + txt_seq, img_h, img_w, 0.0f);
+    int off = txt_seq + img_h * img_w;
+    for (int i = 0; i < num_refs; i++) {
+        image_positions(pos + off, ref_h[i], ref_w[i], -(float)(i + 1));
+        off += ref_h[i] * ref_w[i];
+    }
+    *rope_cos = malloc((size_t)total * half * sizeof(float));
+    *rope_sin = malloc((size_t)total * half * sizeof(float));
+    rope_rows(tf, *rope_cos, *rope_sin, (const float (*)[F3_ROPE_AXES])pos, total);
+    free(pos);
+}
+
 /* ========================================================================
  * Block Forward (CPU)
  * ======================================================================== */
@@ -384,16 +416,416 @@ static void block_forward(iris_transformer_flux3_t *tf, const f3_block_t *b,
     }
 }
 
-/* ========================================================================
- * Forward Pass
- * ======================================================================== */
-
 /* Transpose a channel-first latent [ch, n] into tokens [n, ch]. */
 static void latent_to_tokens(float *tokens, const float *latent, int ch, int n) {
     for (int c = 0; c < ch; c++)
         for (int i = 0; i < n; i++)
             tokens[(size_t)i * ch + c] = latent[(size_t)c * n + i];
 }
+
+#ifdef IRIS_DEV
+/* ========================================================================
+ * GPU Forward (CUDA / ROCm)
+ * ======================================================================== */
+
+/* Device copy of a block. The projections are fused into two GEMMs:
+ * w_in = [to_q; to_k; to_v; ff_in] maps the normalized input to q, k, v and
+ * the FFN gate/up halves; w_out = [to_out | ff_out] maps the concatenated
+ * [attention output | FFN activation] back to dim, summing both terms. */
+typedef struct {
+    uint16_t *w_in;          /* [3*dim + 2*mlp, dim] */
+    uint16_t *w_out;         /* [dim, dim + mlp] */
+    float *norm_q, *norm_k;  /* [head_dim] */
+} f3_dev_block_t;
+
+struct f3_dev {
+    f3_dev_block_t *mode_blocks[F3_NUM_MODES];
+    f3_dev_block_t *single_blocks;
+    uint16_t *t_lin1, *t_lin2, *tt_lin1, *tt_lin2;
+    uint16_t *x_emb[F3_NUM_MODES], *ctx_emb;
+    uint16_t *early_mod[F3_NUM_MODES], *single_mod[F3_NUM_MODES];
+    uint16_t *norm_out, *proj_out;
+
+    /* Activations for up to seq tokens */
+    int seq;
+    float *x;                /* [seq, dim] residual stream */
+    uint16_t *norm;          /* [seq, dim] modulated LayerNorm output */
+    uint16_t *h;             /* [seq, 3*dim + 2*mlp] q, k, v, gate, up */
+    uint16_t *cat;           /* [seq, dim + mlp] attention out, FFN activation */
+    float *out;              /* [seq, dim] block output */
+    float *rope_cos, *rope_sin;  /* [seq, head_dim/2] */
+
+    /* Model inputs (f32 upload + bf16 copy), grown on demand */
+    size_t in_elems;
+    float *in_f32;
+    uint16_t *in_bf16;
+
+    /* Timestep embeddings and modulation vectors, see vec_layout() */
+    float *vec;
+    uint16_t *vec_bf16;
+};
+
+/* Offsets (in floats) inside dev->vec. */
+typedef struct {
+    size_t sin, hidden, temb, target, mod, fin, total;
+} f3_vec_layout_t;
+
+static f3_vec_layout_t vec_layout(const iris_transformer_flux3_t *tf) {
+    f3_vec_layout_t v;
+    size_t dim = tf->dim;
+    v.sin = 0;                               /* 3 sinusoidal embeddings */
+    v.hidden = v.sin + 3 * tf->t_channels;   /* timestep MLP hidden */
+    v.temb = v.hidden + dim;                 /* image / zero embeddings */
+    v.target = v.temb + 2 * dim;             /* target timestep embedding */
+    v.mod = v.target + dim;                  /* early/single mods per mode */
+    v.fin = v.mod + (size_t)2 * F3_NUM_MODES * 3 * dim;  /* output scale, shift */
+    v.total = v.fin + 2 * dim;
+    return v;
+}
+
+static uint16_t *dev_bf16(const uint16_t *src, size_t n) {
+    uint16_t *d = iris_dev_alloc(n * sizeof(uint16_t));
+    if (d) iris_dev_upload(d, src, n * sizeof(uint16_t));
+    return d;
+}
+
+static float *dev_f32(const float *src, size_t n) {
+    float *d = iris_dev_alloc(n * sizeof(float));
+    if (d) iris_dev_upload(d, src, n * sizeof(float));
+    return d;
+}
+
+static int dev_load_block(iris_transformer_flux3_t *tf, f3_dev_block_t *db, const f3_block_t *b) {
+    size_t dim = tf->dim, mlp = tf->mlp, es = sizeof(uint16_t);
+    size_t dd = dim * dim;
+
+    /* w_in: vertical concatenation, the parts are contiguous rows. */
+    db->w_in = iris_dev_alloc((3 * dim + 2 * mlp) * dim * es);
+    if (db->w_in) {
+        iris_dev_upload(db->w_in, b->to_q, dd * es);
+        iris_dev_upload(db->w_in + dd, b->to_k, dd * es);
+        iris_dev_upload(db->w_in + 2 * dd, b->to_v, dd * es);
+        iris_dev_upload(db->w_in + 3 * dd, b->ff_in, 2 * mlp * dim * es);
+    }
+
+    /* w_out: each row is the to_out row followed by the ff_out row. */
+    db->w_out = iris_dev_alloc(dim * (dim + mlp) * es);
+    if (db->w_out) {
+        iris_dev_upload_2d(db->w_out, (dim + mlp) * es, b->to_out, dim * es, dim * es, dim);
+        iris_dev_upload_2d(db->w_out + dim, (dim + mlp) * es, b->ff_out, mlp * es, mlp * es, dim);
+    }
+
+    db->norm_q = dev_f32(b->norm_q, tf->head_dim);
+    db->norm_k = dev_f32(b->norm_k, tf->head_dim);
+    return db->w_in && db->w_out && db->norm_q && db->norm_k;
+}
+
+static void dev_free_block(f3_dev_block_t *db) {
+    iris_dev_free(db->w_in);
+    iris_dev_free(db->w_out);
+    iris_dev_free(db->norm_q);
+    iris_dev_free(db->norm_k);
+}
+
+static void dev_free_activations(struct f3_dev *d) {
+    iris_dev_free(d->x);
+    iris_dev_free(d->norm);
+    iris_dev_free(d->h);
+    iris_dev_free(d->cat);
+    iris_dev_free(d->out);
+    iris_dev_free(d->rope_cos);
+    iris_dev_free(d->rope_sin);
+    d->x = d->out = d->rope_cos = d->rope_sin = NULL;
+    d->norm = d->h = d->cat = NULL;
+    d->seq = 0;
+}
+
+static void dev_free(iris_transformer_flux3_t *tf) {
+    struct f3_dev *d = tf->dev;
+    if (!d) return;
+    for (int m = 0; m < F3_NUM_MODES; m++) {
+        if (!d->mode_blocks[m]) continue;
+        for (int l = 0; l < tf->num_mode_layers; l++) dev_free_block(&d->mode_blocks[m][l]);
+        free(d->mode_blocks[m]);
+        iris_dev_free(d->x_emb[m]);
+        iris_dev_free(d->early_mod[m]);
+        iris_dev_free(d->single_mod[m]);
+    }
+    if (d->single_blocks) {
+        for (int l = 0; l < tf->num_single_layers; l++) dev_free_block(&d->single_blocks[l]);
+        free(d->single_blocks);
+    }
+    iris_dev_free(d->t_lin1);
+    iris_dev_free(d->t_lin2);
+    iris_dev_free(d->tt_lin1);
+    iris_dev_free(d->tt_lin2);
+    iris_dev_free(d->ctx_emb);
+    iris_dev_free(d->norm_out);
+    iris_dev_free(d->proj_out);
+    dev_free_activations(d);
+    iris_dev_free(d->in_f32);
+    iris_dev_free(d->in_bf16);
+    iris_dev_free(d->vec);
+    iris_dev_free(d->vec_bf16);
+    free(d);
+    tf->dev = NULL;
+}
+
+/* Upload the model to the device. Returns 0 (leaving tf->dev NULL) if the
+ * device runs out of memory, so the CPU path is used instead. */
+static int dev_load(iris_transformer_flux3_t *tf) {
+    struct f3_dev *d = calloc(1, sizeof(*d));
+    if (!d) return 0;
+    tf->dev = d;
+    size_t dim = tf->dim, ok = 1;
+
+    d->t_lin1 = dev_bf16(tf->t_lin1, dim * tf->t_channels);
+    d->t_lin2 = dev_bf16(tf->t_lin2, dim * dim);
+    ok &= d->t_lin1 && d->t_lin2;
+    if (tf->flow_map) {
+        d->tt_lin1 = dev_bf16(tf->tt_lin1, dim * tf->t_channels);
+        d->tt_lin2 = dev_bf16(tf->tt_lin2, dim * dim);
+        ok &= d->tt_lin1 && d->tt_lin2;
+    }
+    d->ctx_emb = dev_bf16(tf->ctx_emb, dim * tf->text_dim);
+    d->x_emb[F3_IMG] = dev_bf16(tf->x_emb[F3_IMG], dim * tf->in_channels);
+    d->x_emb[F3_COND] = dev_bf16(tf->x_emb[F3_COND], dim * tf->cond_in_channels);
+    d->norm_out = dev_bf16(tf->norm_out, 2 * dim * dim);
+    d->proj_out = dev_bf16(tf->proj_out, (size_t)tf->in_channels * dim);
+    ok &= d->ctx_emb && d->x_emb[F3_IMG] && d->x_emb[F3_COND] && d->norm_out && d->proj_out;
+
+    for (int m = 0; ok && m < F3_NUM_MODES; m++) {
+        d->early_mod[m] = dev_bf16(tf->early_mod[m], 3 * dim * dim);
+        d->single_mod[m] = dev_bf16(tf->single_mod[m], 3 * dim * dim);
+        d->mode_blocks[m] = calloc(tf->num_mode_layers, sizeof(f3_dev_block_t));
+        ok &= d->early_mod[m] && d->single_mod[m] && d->mode_blocks[m];
+        for (int l = 0; ok && l < tf->num_mode_layers; l++)
+            ok &= dev_load_block(tf, &d->mode_blocks[m][l], &tf->mode_blocks[m][l]);
+    }
+    d->single_blocks = ok ? calloc(tf->num_single_layers, sizeof(f3_dev_block_t)) : NULL;
+    ok &= d->single_blocks != NULL;
+    for (int l = 0; ok && l < tf->num_single_layers; l++)
+        ok &= dev_load_block(tf, &d->single_blocks[l], &tf->single_blocks[l]);
+
+    f3_vec_layout_t vl = vec_layout(tf);
+    d->vec = ok ? iris_dev_alloc(vl.total * sizeof(float)) : NULL;
+    d->vec_bf16 = ok ? iris_dev_alloc(vl.total * sizeof(uint16_t)) : NULL;
+    ok &= d->vec && d->vec_bf16;
+
+    if (!ok) {
+        fprintf(stderr, "FLUX.3: not enough GPU memory, using the CPU\n");
+        dev_free(tf);
+        return 0;
+    }
+    iris_dev_sync();
+    return 1;
+}
+
+static int dev_ensure(iris_transformer_flux3_t *tf, int seq, size_t in_elems) {
+    struct f3_dev *d = tf->dev;
+    size_t dim = tf->dim, mlp = tf->mlp, half = tf->head_dim / 2;
+    if (seq > d->seq) {
+        dev_free_activations(d);
+        d->x = iris_dev_alloc((size_t)seq * dim * sizeof(float));
+        d->norm = iris_dev_alloc((size_t)seq * dim * sizeof(uint16_t));
+        d->h = iris_dev_alloc((size_t)seq * (3 * dim + 2 * mlp) * sizeof(uint16_t));
+        d->cat = iris_dev_alloc((size_t)seq * (dim + mlp) * sizeof(uint16_t));
+        d->out = iris_dev_alloc((size_t)seq * dim * sizeof(float));
+        d->rope_cos = iris_dev_alloc((size_t)seq * half * sizeof(float));
+        d->rope_sin = iris_dev_alloc((size_t)seq * half * sizeof(float));
+        if (!d->x || !d->norm || !d->h || !d->cat || !d->out || !d->rope_cos || !d->rope_sin) {
+            dev_free_activations(d);
+            return 0;
+        }
+        d->seq = seq;
+    }
+    if (in_elems > d->in_elems) {
+        iris_dev_free(d->in_f32);
+        iris_dev_free(d->in_bf16);
+        d->in_f32 = iris_dev_alloc(in_elems * sizeof(float));
+        d->in_bf16 = iris_dev_alloc(in_elems * sizeof(uint16_t));
+        d->in_elems = (d->in_f32 && d->in_bf16) ? in_elems : 0;
+        if (!d->in_elems) return 0;
+    }
+    return 1;
+}
+
+/* out[dim] = lin2(silu(lin1(sinusoidal))) for a sinusoidal embedding
+ * already on the device. */
+static void dev_timestep_embed(iris_transformer_flux3_t *tf, float *out, const float *sin_emb,
+                               const uint16_t *lin1, const uint16_t *lin2) {
+    struct f3_dev *d = tf->dev;
+    f3_vec_layout_t vl = vec_layout(tf);
+    float *hidden = d->vec + vl.hidden;
+    uint16_t *sin_b = d->vec_bf16 + vl.sin, *hidden_b = d->vec_bf16 + vl.hidden;
+    iris_dev_f32_to_bf16(sin_b, sin_emb, tf->t_channels);
+    iris_dev_linear_f32(hidden, sin_b, lin1, 1, tf->t_channels, tf->dim);
+    iris_dev_silu(hidden, tf->dim);
+    iris_dev_f32_to_bf16(hidden_b, hidden, tf->dim);
+    iris_dev_linear_f32(out, hidden_b, lin2, 1, tf->dim, tf->dim);
+}
+
+/* Project input rows (f32 on the host) into the residual stream. */
+static void dev_embed(iris_transformer_flux3_t *tf, float *x, const float *in, int rows,
+                      int in_dim, const uint16_t *W) {
+    struct f3_dev *d = tf->dev;
+    size_t n = (size_t)rows * in_dim;
+    iris_dev_upload(d->in_f32, in, n * sizeof(float));
+    iris_dev_f32_to_bf16(d->in_bf16, d->in_f32, n);
+    iris_dev_linear_f32(x, d->in_bf16, W, rows, in_dim, tf->dim);
+}
+
+/* One block on the device over x[seq, dim], same math as block_forward().
+ * Segment modulation vectors are device pointers. */
+static void dev_block_forward(iris_transformer_flux3_t *tf, const f3_dev_block_t *b,
+                              float *x, int seq, const f3_segment_t *segs, int nsegs,
+                              const float *rope_cos, const float *rope_sin) {
+    struct f3_dev *d = tf->dev;
+    int dim = tf->dim, mlp = tf->mlp, hd = tf->head_dim;
+    int ldh = 3 * dim + 2 * mlp, ldc = dim + mlp;
+
+    for (int g = 0; g < nsegs; g++) {
+        size_t off = (size_t)segs[g].start * dim;
+        iris_dev_layer_norm_mod(d->norm + off, x + off, segs[g].mod, segs[g].mod + dim,
+                                segs[g].len, dim, tf->eps);
+    }
+    iris_dev_linear_bf16(d->h, d->norm, b->w_in, seq, dim, ldh);
+    iris_dev_head_norm_rope(d->h, ldh, b->norm_q, rope_cos, rope_sin, seq, tf->heads, hd, tf->eps, 0);
+    iris_dev_head_norm_rope(d->h + dim, ldh, b->norm_k, rope_cos, rope_sin, seq, tf->heads, hd, tf->eps, 0);
+    iris_dev_attention(d->cat, ldc, d->h, d->h + dim, d->h + 2 * dim, ldh, seq, seq,
+                       tf->heads, tf->heads, hd, 1.0f / sqrtf((float)hd), 0, NULL);
+    iris_dev_swiglu(d->cat + dim, ldc, d->h + 3 * dim, d->h + 3 * dim + mlp, ldh, seq, mlp);
+    iris_dev_linear_f32(d->out, d->cat, b->w_out, seq, dim + mlp, dim);
+    for (int g = 0; g < nsegs; g++) {
+        size_t off = (size_t)segs[g].start * dim;
+        iris_dev_residual(x + off, d->out + off, segs[g].mod + 2 * dim, segs[g].len, dim);
+    }
+}
+
+static float *forward_dev(iris_transformer_flux3_t *tf,
+                          const float *img, int img_h, int img_w,
+                          const float *txt, int txt_seq,
+                          const float *const *refs, const int *ref_h,
+                          const int *ref_w, int num_refs,
+                          float t, float t_target) {
+    struct f3_dev *d = tf->dev;
+    int dim = tf->dim, half = tf->head_dim / 2;
+    int img_seq = img_h * img_w;
+    int cond_seq = 0;
+    for (int i = 0; i < num_refs; i++) cond_seq += ref_h[i] * ref_w[i];
+    int total = txt_seq + img_seq + cond_seq;
+    size_t in_elems = (size_t)txt_seq * tf->text_dim;
+    if ((size_t)img_seq * tf->in_channels > in_elems) in_elems = (size_t)img_seq * tf->in_channels;
+    if ((size_t)cond_seq * tf->cond_in_channels > in_elems)
+        in_elems = (size_t)cond_seq * tf->cond_in_channels;
+    if (!dev_ensure(tf, total, in_elems)) {
+        fprintf(stderr, "FLUX.3: GPU allocation failed for %d tokens\n", total);
+        return NULL;
+    }
+    f3_vec_layout_t vl = vec_layout(tf);
+
+    /* 1. Timestep embeddings (image at t, text and references at 0), plus
+     *    the target timestep for flow maps, then SiLU. */
+    int tc = tf->t_channels;
+    float sin_host[3 * 512];
+    sinusoidal_embedding(sin_host, t * 1000.0f, tc);
+    sinusoidal_embedding(sin_host + tc, 0.0f, tc);
+    sinusoidal_embedding(sin_host + 2 * tc, t_target * 1000.0f, tc);
+    iris_dev_upload(d->vec + vl.sin, sin_host, 3 * tc * sizeof(float));
+    float *temb_img = d->vec + vl.temb, *temb_zero = temb_img + dim;
+    dev_timestep_embed(tf, temb_img, d->vec + vl.sin, d->t_lin1, d->t_lin2);
+    dev_timestep_embed(tf, temb_zero, d->vec + vl.sin + tc, d->t_lin1, d->t_lin2);
+    if (tf->flow_map) {
+        float *tt = d->vec + vl.target;
+        dev_timestep_embed(tf, tt, d->vec + vl.sin + 2 * tc, d->tt_lin1, d->tt_lin2);
+        iris_dev_add(temb_img, tt, dim);
+        iris_dev_add(temb_zero, tt, dim);
+    }
+    iris_dev_silu(temb_img, 2 * dim);
+    uint16_t *act_img = d->vec_bf16 + vl.temb, *act_zero = act_img + dim;
+    iris_dev_f32_to_bf16(act_img, temb_img, 2 * dim);
+
+    /* 2. Modulation vectors and output layer scale/shift. */
+    float *early[F3_NUM_MODES], *single[F3_NUM_MODES];
+    for (int m = 0; m < F3_NUM_MODES; m++) {
+        const uint16_t *act = (m == F3_IMG) ? act_img : act_zero;
+        early[m] = d->vec + vl.mod + (size_t)(2 * m) * 3 * dim;
+        single[m] = d->vec + vl.mod + (size_t)(2 * m + 1) * 3 * dim;
+        if (m == F3_COND && num_refs == 0) continue;
+        iris_dev_linear_f32(early[m], act, d->early_mod[m], 1, dim, 3 * dim);
+        iris_dev_linear_f32(single[m], act, d->single_mod[m], 1, dim, 3 * dim);
+    }
+    float *fin = d->vec + vl.fin;
+    iris_dev_linear_f32(fin, act_img, d->norm_out, 1, dim, 2 * dim);
+
+    /* 3. Input projections into the joint sequence [TXT, IMG, COND]. */
+    float *xi = d->x + (size_t)txt_seq * dim;
+    dev_embed(tf, d->x, txt, txt_seq, tf->text_dim, d->ctx_emb);
+    float *tokens = malloc(in_elems * sizeof(float));
+    latent_to_tokens(tokens, img, tf->in_channels, img_seq);
+    dev_embed(tf, xi, tokens, img_seq, tf->in_channels, d->x_emb[F3_IMG]);
+    float *xr = xi + (size_t)img_seq * dim;
+    for (int i = 0; i < num_refs; i++) {
+        int n = ref_h[i] * ref_w[i];
+        latent_to_tokens(tokens, refs[i], tf->cond_in_channels, n);
+        dev_embed(tf, xr, tokens, n, tf->cond_in_channels, d->x_emb[F3_COND]);
+        xr += (size_t)n * dim;
+    }
+    free(tokens);
+
+    /* 4. RoPE tables. */
+    float *rope_cos, *rope_sin;
+    joint_rope(tf, txt_seq, img_h, img_w, ref_h, ref_w, num_refs, &rope_cos, &rope_sin);
+    iris_dev_upload(d->rope_cos, rope_cos, (size_t)total * half * sizeof(float));
+    iris_dev_upload(d->rope_sin, rope_sin, (size_t)total * half * sizeof(float));
+    free(rope_cos);
+    free(rope_sin);
+
+    /* 5. Per-mode blocks. */
+    int mode_start[F3_NUM_MODES] = {0, txt_seq, txt_seq + img_seq};
+    int mode_len[F3_NUM_MODES] = {txt_seq, img_seq, cond_seq};
+    for (int m = 0; m < F3_NUM_MODES; m++) {
+        if (mode_len[m] == 0) continue;
+        f3_segment_t seg = {0, mode_len[m], early[m]};
+        float *xm = d->x + (size_t)mode_start[m] * dim;
+        for (int l = 0; l < tf->num_mode_layers; l++)
+            dev_block_forward(tf, &d->mode_blocks[m][l], xm, mode_len[m], &seg, 1,
+                              d->rope_cos + (size_t)mode_start[m] * half,
+                              d->rope_sin + (size_t)mode_start[m] * half);
+    }
+
+    /* 6. Joint blocks. */
+    f3_segment_t segs[F3_NUM_MODES];
+    int nsegs = 0;
+    for (int m = 0; m < F3_NUM_MODES; m++) {
+        if (mode_len[m] == 0) continue;
+        segs[nsegs].start = mode_start[m];
+        segs[nsegs].len = mode_len[m];
+        segs[nsegs].mod = single[m];
+        nsegs++;
+    }
+    for (int l = 0; l < tf->num_single_layers; l++)
+        dev_block_forward(tf, &d->single_blocks[l], d->x, total, segs, nsegs,
+                          d->rope_cos, d->rope_sin);
+
+    /* 7. Output layer on the image tokens. */
+    iris_dev_layer_norm_mod(d->norm, xi, fin + dim, fin, img_seq, dim, tf->eps);
+    iris_dev_linear_f32(d->out, d->norm, d->proj_out, img_seq, dim, tf->in_channels);
+    float *vel_tokens = malloc((size_t)img_seq * tf->in_channels * sizeof(float));
+    iris_dev_download(vel_tokens, d->out, (size_t)img_seq * tf->in_channels * sizeof(float));
+
+    float *out = malloc((size_t)tf->in_channels * img_seq * sizeof(float));
+    for (int s = 0; s < img_seq; s++)
+        for (int c = 0; c < tf->in_channels; c++)
+            out[(size_t)c * img_seq + s] = vel_tokens[(size_t)s * tf->in_channels + c];
+    free(vel_tokens);
+    return out;
+}
+#endif /* IRIS_DEV */
+
+/* ========================================================================
+ * Forward Pass
+ * ======================================================================== */
 
 /* Predict the velocity of the image latent.
  *
@@ -411,6 +843,11 @@ float *iris_transformer_forward_flux3(iris_transformer_flux3_t *tf,
                                       const float *const *refs, const int *ref_h,
                                       const int *ref_w, int num_refs,
                                       float t, float t_target) {
+#ifdef IRIS_DEV
+    if (tf->dev)
+        return forward_dev(tf, img, img_h, img_w, txt, txt_seq, refs, ref_h, ref_w,
+                           num_refs, t, t_target);
+#endif
     int dim = tf->dim;
     int img_seq = img_h * img_w;
     int cond_seq = 0;
@@ -470,18 +907,8 @@ float *iris_transformer_forward_flux3(iris_transformer_flux3_t *tf,
     free(tokens);
 
     /* 4. RoPE tables for the joint sequence. */
-    float (*pos)[F3_ROPE_AXES] = calloc(total, sizeof(*pos));
-    for (int s = 0; s < txt_seq; s++) pos[s][3] = (float)s;
-    image_positions(pos + txt_seq, img_h, img_w, 0.0f);
-    int off = txt_seq + img_seq;
-    for (int i = 0; i < num_refs; i++) {
-        image_positions(pos + off, ref_h[i], ref_w[i], -(float)(i + 1));
-        off += ref_h[i] * ref_w[i];
-    }
-    float *rope_cos = malloc((size_t)total * half * sizeof(float));
-    float *rope_sin = malloc((size_t)total * half * sizeof(float));
-    rope_rows(tf, rope_cos, rope_sin, (const float (*)[F3_ROPE_AXES])pos, total);
-    free(pos);
+    float *rope_cos, *rope_sin;
+    joint_rope(tf, txt_seq, img_h, img_w, ref_h, ref_w, num_refs, &rope_cos, &rope_sin);
 
     /* 5. Per-mode blocks, each mode attending within itself. */
     int mode_start[F3_NUM_MODES] = {0, txt_seq, txt_seq + img_seq};
@@ -740,10 +1167,13 @@ iris_transformer_flux3_t *iris_transformer_load_flux3(const char *model_dir) {
         if (!load_block(tf, &tf->single_blocks[l], name)) goto error;
     }
 
+#ifdef IRIS_DEV
+    if (iris_dev_available()) dev_load(tf);
+#endif
     if (iris_verbose)
-        fprintf(stderr, "  FLUX.3 transformer: dim=%d heads=%d blocks=%dx3+%d mlp=%d%s\n",
+        fprintf(stderr, "  FLUX.3 transformer: dim=%d heads=%d blocks=%dx3+%d mlp=%d%s%s\n",
                 tf->dim, tf->heads, tf->num_mode_layers, tf->num_single_layers,
-                tf->mlp, tf->flow_map ? " (flow map)" : "");
+                tf->mlp, tf->flow_map ? " (flow map)" : "", tf->dev ? " on GPU" : "");
     return tf;
 
 error:
@@ -758,6 +1188,9 @@ static void free_block(f3_block_t *b) {
 
 void iris_transformer_free_flux3(iris_transformer_flux3_t *tf) {
     if (!tf) return;
+#ifdef IRIS_DEV
+    dev_free(tf);
+#endif
     for (int m = 0; m < F3_NUM_MODES; m++) {
         if (!tf->mode_blocks[m]) continue;
         for (int l = 0; l < tf->num_mode_layers; l++) free_block(&tf->mode_blocks[m][l]);

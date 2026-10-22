@@ -1,6 +1,6 @@
 # Iris - a C inference pipeline for image synthesis models
 
-Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
+Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS, CUDA, ROCm and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
 
 The name comes from the Greek goddess Iris, messenger of the gods and personification of the rainbow.
 
@@ -17,12 +17,15 @@ Supported model families:
   - **5.6B distilled** (16 steps by default, trained for 4 to 16, no CFG. FLUX Kommunity License).
   - **5.6B base** (50 steps, CFG. FLUX Kommunity License).
   - Text-to-image only for now (reference images are not supported yet).
+  - Runs fully on the GPU with the CUDA (NVIDIA) and ROCm (AMD) backends.
 
 ## Quick Start
 
 ```bash
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
+# or: make cuda    # NVIDIA GPU (FLUX.3)
+# or: make rocm    # AMD GPU (FLUX.3)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
 # or: make generic # Pure C, no dependencies
 
@@ -285,13 +288,24 @@ make            # Show available backends
 make generic    # Pure C, no dependencies (slow)
 make blas       # BLAS acceleration (~30x faster)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
+make cuda       # NVIDIA GPU (needs the CUDA toolkit, with cuBLAS)
+make rocm       # AMD GPU (needs ROCm, with hipBLAS)
 ```
 
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
+- Linux with an NVIDIA / AMD GPU, for FLUX.3: `make cuda` / `make rocm`
 - Linux with OpenBLAS: `make blas`
 - Linux without OpenBLAS: `make generic`
+
+The CUDA and ROCm backends run the whole FLUX.3 pipeline on the GPU (text
+encoder, transformer, VAE), in bf16 with f32 accumulation. FLUX.2 and
+Z-Image use the GPU for the text encoder and the VAE but run their
+transformer on the CPU in these builds: add `OPENBLAS=1` to use OpenBLAS
+for the CPU work. The build targets the GPU of the machine it runs on; set
+`GPU_ARCH` (e.g. `GPU_ARCH=sm_121` or `GPU_ARCH=gfx1151`) to build for
+another one, and `CUDA_HOME` / `ROCM_HOME` for non-standard install paths.
 
 For `make blas` on Linux, install OpenBLAS first:
 ```bash
@@ -403,6 +417,17 @@ The MPS implementation is faster than the PyTorch optimized pipeline at all reso
 - The C BLAS backend (CPU) is not shown.
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 - The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14.23 seconds (in the same hardware), however it is worth noting that it uses 6-bit quantized weights, while this implementation uses the official BF16 weights. The 6-bit quantization used by Draw Things provides both a big memory win and a moderate speed advantage (not nearly as much as it could in an LLM, where causal attention is dominated by memory bandwidth); if we account for this, the performance is comparable.
+
+### FLUX.3 on CUDA and ROCm
+
+FLUX.3 Image Klein distilled, default 16 steps, wall clock including model
+loading:
+
+| Size | NVIDIA GB10 (CUDA) | AMD Strix Halo, Radeon 8060S (ROCm) |
+|------|--------------------|--------------------------------------|
+| 256x256 | 4.3s | 5.7s |
+| 512x512 | 5.6s | 11.8s |
+| 1024x1024 | 13.8s | 39.4s |
 
 ### Community Benchmarks
 

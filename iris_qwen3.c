@@ -31,6 +31,11 @@
 #include "iris_metal.h"
 #endif
 
+/* CUDA / ROCm device backend */
+#ifdef IRIS_DEV
+#include "iris_dev.h"
+#endif
+
 /* Minimum matrix size for GPU acceleration.
  * Using 10M threshold keeps text encoder on CPU (Accelerate BLAS), which is
  * faster and avoids GPU memory pressure on 16GB systems. Text encoder weights
@@ -136,6 +141,9 @@ struct qwen3_model {
 
     /* BF16 GPU acceleration */
     int use_bf16;
+
+    /* Device copy of the layers (CUDA / ROCm), NULL until first used */
+    struct qwen3_dev *dev;
 };
 
 /* Forward declarations for mmap streaming mode */
@@ -148,6 +156,11 @@ static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **fi
                                    int num_files, const char *prefix, int layer_idx);
 #endif
 static void free_layer_weights(qwen3_layer_t *layer);
+#ifdef IRIS_DEV
+static int qwen3_forward_dev(qwen3_model_t *model, int seq_len, const int *attention_mask,
+                             const int *out_layers, int num_out);
+static void qwen3_dev_free(qwen3_model_t *model);
+#endif
 
 /* ========================================================================
  * Basic Operations
@@ -1111,6 +1124,12 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     }
 
     /* Run through transformer layers */
+#ifdef IRIS_DEV
+    /* CUDA / ROCm: whole forward pass on the GPU, weights from the mmap */
+    if (iris_dev_available() && model->use_mmap &&
+        qwen3_forward_dev(model, seq_len, attention_mask, out_layers, num_out))
+        goto concatenate;
+#endif
 #ifdef USE_METAL
     /* Try fully GPU-resident path: 1 sync instead of 72, skips unneeded layers */
     if (model->use_bf16 && iris_metal_available() && seq_len <= 512) {
@@ -1183,7 +1202,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
 #endif
 
     /* Build output embeddings */
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(IRIS_DEV)
 concatenate: (void)0; /* label needs a statement; can't precede a declaration in C */
 #endif
     int text_dim = num_out * hidden;
@@ -1218,7 +1237,7 @@ static float *load_tensor(safetensors_file_t **files, int num_files, const char 
     return NULL;
 }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(IRIS_DEV)
 /* Helper to load bf16 tensor directly (zero-copy from mmap region) */
 static uint16_t *load_tensor_bf16(safetensors_file_t **files, int num_files, const char *name) {
     for (int f = 0; f < num_files; f++) {
@@ -1229,6 +1248,9 @@ static uint16_t *load_tensor_bf16(safetensors_file_t **files, int num_files, con
     }
     return NULL;  /* Not found or not bf16 - fall back to f32 */
 }
+#endif
+
+#ifdef USE_METAL
 
 /* Load only small f32 weights for bf16 path (layer norms and q/k norms) */
 static int load_layer_weights_small_f32(qwen3_layer_t *layer, safetensors_file_t **files,
@@ -1373,9 +1395,225 @@ static void free_layer_weights(qwen3_layer_t *layer) {
     memset(layer, 0, sizeof(*layer));
 }
 
+#ifdef IRIS_DEV
 /* ========================================================================
- * Qwen3 Config Parsing and Dynamic Shard Loading
+ * GPU Forward (CUDA / ROCm)
  * ======================================================================== */
+
+/* Device copy of one layer, with q/k/v and gate/up fused into one GEMM each. */
+typedef struct {
+    uint16_t *w_qkv;              /* [q_dim + 2 * kv_dim, hidden] */
+    uint16_t *w_o;                /* [hidden, q_dim] */
+    uint16_t *w_gate_up;          /* [2 * intermediate, hidden] */
+    uint16_t *w_down;             /* [hidden, intermediate] */
+    float *in_norm, *post_norm;   /* [hidden] */
+    float *q_norm, *k_norm;       /* [head_dim] */
+} qwen3_dev_layer_t;
+
+struct qwen3_dev {
+    qwen3_dev_layer_t *layers;    /* [num_layers] */
+    int num_loaded;               /* layers [0, num_loaded) are uploaded */
+    int seq;                      /* activations sized for seq tokens */
+    float *x, *out;               /* [seq, hidden] residual stream, sublayer out */
+    uint16_t *norm;               /* [seq, hidden] */
+    uint16_t *qkv;                /* [seq, q_dim + 2 * kv_dim] */
+    uint16_t *attn;               /* [seq, q_dim] */
+    uint16_t *gate_up;            /* [seq, 2 * intermediate] */
+    uint16_t *act;                /* [seq, intermediate] */
+    float *rope_cos, *rope_sin;   /* [seq, head_dim / 2] */
+    int *mask;                    /* [seq] */
+};
+
+static void *dev_copy(const void *src, size_t bytes) {
+    void *d = iris_dev_alloc(bytes);
+    if (d) iris_dev_upload(d, src, bytes);
+    return d;
+}
+
+/* Upload a small tensor (n elements) converted to f32. */
+static float *dev_f32_tensor(qwen3_model_t *model, const char *name, size_t n) {
+    float *host = load_tensor(model->sf_files, model->num_sf_files, name);
+    if (!host) return NULL;
+    float *d = dev_copy(host, n * sizeof(float));
+    free(host);
+    return d;
+}
+
+static int qwen3_dev_load_layer(qwen3_model_t *model, qwen3_dev_layer_t *dl, int idx) {
+    size_t hidden = model->hidden_size, inter = model->intermediate_size;
+    size_t q_dim = (size_t)model->num_heads * model->head_dim;
+    size_t kv_dim = (size_t)model->num_kv_heads * model->head_dim;
+    const char *names[7] = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                            "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj",
+                            "mlp.down_proj"};
+    const uint16_t *w[7];
+    char name[256];
+    for (int i = 0; i < 7; i++) {
+        snprintf(name, sizeof(name), "%slayers.%d.%s.weight", model->prefix, idx, names[i]);
+        w[i] = load_tensor_bf16(model->sf_files, model->num_sf_files, name);
+        if (!w[i]) return 0;
+    }
+
+    size_t es = sizeof(uint16_t);
+    dl->w_qkv = iris_dev_alloc((q_dim + 2 * kv_dim) * hidden * es);
+    if (dl->w_qkv) {
+        iris_dev_upload(dl->w_qkv, w[0], q_dim * hidden * es);
+        iris_dev_upload(dl->w_qkv + q_dim * hidden, w[1], kv_dim * hidden * es);
+        iris_dev_upload(dl->w_qkv + (q_dim + kv_dim) * hidden, w[2], kv_dim * hidden * es);
+    }
+    dl->w_gate_up = iris_dev_alloc(2 * inter * hidden * es);
+    if (dl->w_gate_up) {
+        iris_dev_upload(dl->w_gate_up, w[4], inter * hidden * es);
+        iris_dev_upload(dl->w_gate_up + inter * hidden, w[5], inter * hidden * es);
+    }
+    dl->w_o = dev_copy(w[3], hidden * q_dim * sizeof(uint16_t));
+    dl->w_down = dev_copy(w[6], hidden * inter * sizeof(uint16_t));
+
+    snprintf(name, sizeof(name), "%slayers.%d.input_layernorm.weight", model->prefix, idx);
+    dl->in_norm = dev_f32_tensor(model, name, hidden);
+    snprintf(name, sizeof(name), "%slayers.%d.post_attention_layernorm.weight", model->prefix, idx);
+    dl->post_norm = dev_f32_tensor(model, name, hidden);
+    snprintf(name, sizeof(name), "%slayers.%d.self_attn.q_norm.weight", model->prefix, idx);
+    dl->q_norm = dev_f32_tensor(model, name, model->head_dim);
+    snprintf(name, sizeof(name), "%slayers.%d.self_attn.k_norm.weight", model->prefix, idx);
+    dl->k_norm = dev_f32_tensor(model, name, model->head_dim);
+    return dl->w_qkv && dl->w_gate_up && dl->w_o && dl->w_down &&
+           dl->in_norm && dl->post_norm && dl->q_norm && dl->k_norm;
+}
+
+static void qwen3_dev_free_activations(struct qwen3_dev *d) {
+    iris_dev_free(d->x);
+    iris_dev_free(d->out);
+    iris_dev_free(d->norm);
+    iris_dev_free(d->qkv);
+    iris_dev_free(d->attn);
+    iris_dev_free(d->gate_up);
+    iris_dev_free(d->act);
+    iris_dev_free(d->rope_cos);
+    iris_dev_free(d->rope_sin);
+    iris_dev_free(d->mask);
+    d->x = d->out = d->rope_cos = d->rope_sin = NULL;
+    d->norm = d->qkv = d->attn = d->gate_up = d->act = NULL;
+    d->mask = NULL;
+    d->seq = 0;
+}
+
+static void qwen3_dev_free(qwen3_model_t *model) {
+    struct qwen3_dev *d = model->dev;
+    if (!d) return;
+    for (int i = 0; i < d->num_loaded; i++) {
+        qwen3_dev_layer_t *dl = &d->layers[i];
+        iris_dev_free(dl->w_qkv);
+        iris_dev_free(dl->w_o);
+        iris_dev_free(dl->w_gate_up);
+        iris_dev_free(dl->w_down);
+        iris_dev_free(dl->in_norm);
+        iris_dev_free(dl->post_norm);
+        iris_dev_free(dl->q_norm);
+        iris_dev_free(dl->k_norm);
+    }
+    free(d->layers);
+    qwen3_dev_free_activations(d);
+    free(d);
+    model->dev = NULL;
+}
+
+/* Upload layers up to last_layer and size the activations for seq tokens. */
+static int qwen3_dev_prepare(qwen3_model_t *model, int last_layer, int seq) {
+    if (!model->dev) {
+        model->dev = calloc(1, sizeof(struct qwen3_dev));
+        if (!model->dev) return 0;
+        model->dev->layers = calloc(model->num_layers, sizeof(qwen3_dev_layer_t));
+        if (!model->dev->layers) return 0;
+    }
+    struct qwen3_dev *d = model->dev;
+    while (d->num_loaded <= last_layer) {
+        int ok = qwen3_dev_load_layer(model, &d->layers[d->num_loaded], d->num_loaded);
+        d->num_loaded++;   /* free() handles a partially uploaded layer */
+        if (!ok) return 0;
+    }
+    if (seq > d->seq) {
+        size_t hidden = model->hidden_size, inter = model->intermediate_size;
+        size_t q_dim = (size_t)model->num_heads * model->head_dim;
+        size_t kv_dim = (size_t)model->num_kv_heads * model->head_dim;
+        size_t half = model->head_dim / 2;
+        qwen3_dev_free_activations(d);
+        d->x = iris_dev_alloc(seq * hidden * sizeof(float));
+        d->out = iris_dev_alloc(seq * hidden * sizeof(float));
+        d->norm = iris_dev_alloc(seq * hidden * sizeof(uint16_t));
+        d->qkv = iris_dev_alloc(seq * (q_dim + 2 * kv_dim) * sizeof(uint16_t));
+        d->attn = iris_dev_alloc(seq * q_dim * sizeof(uint16_t));
+        d->gate_up = iris_dev_alloc(seq * 2 * inter * sizeof(uint16_t));
+        d->act = iris_dev_alloc(seq * inter * sizeof(uint16_t));
+        d->rope_cos = iris_dev_alloc(seq * half * sizeof(float));
+        d->rope_sin = iris_dev_alloc(seq * half * sizeof(float));
+        d->mask = iris_dev_alloc(seq * sizeof(int));
+        if (!d->x || !d->out || !d->norm || !d->qkv || !d->attn || !d->gate_up ||
+            !d->act || !d->rope_cos || !d->rope_sin || !d->mask) {
+            qwen3_dev_free_activations(d);
+            return 0;
+        }
+        d->seq = seq;
+    }
+    return 1;
+}
+
+/* Forward pass on the GPU. model->hidden_state holds the token embeddings
+ * and the RoPE tables are filled; on success the outputs of the extracted
+ * layers are in model->layer_outputs. Returns 0 to fall back to the CPU. */
+static int qwen3_forward_dev(qwen3_model_t *model, int seq_len, const int *attention_mask,
+                             const int *out_layers, int num_out) {
+    int last_layer = out_layers[num_out - 1];
+    if (!qwen3_dev_prepare(model, last_layer, seq_len)) {
+        fprintf(stderr, "Qwen3: GPU allocation failed, using the CPU\n");
+        qwen3_dev_free(model);
+        return 0;
+    }
+    struct qwen3_dev *d = model->dev;
+    int hidden = model->hidden_size, inter = model->intermediate_size, hd = model->head_dim;
+    int q_dim = model->num_heads * hd, kv_dim = model->num_kv_heads * hd;
+    int ldqkv = q_dim + 2 * kv_dim;
+    float eps = QWEN3_RMS_NORM_EPS;
+
+    iris_dev_upload(d->x, model->hidden_state, (size_t)seq_len * hidden * sizeof(float));
+    iris_dev_upload(d->rope_cos, model->rope_cos, (size_t)seq_len * (hd / 2) * sizeof(float));
+    iris_dev_upload(d->rope_sin, model->rope_sin, (size_t)seq_len * (hd / 2) * sizeof(float));
+    if (attention_mask) iris_dev_upload(d->mask, attention_mask, seq_len * sizeof(int));
+
+    for (int l = 0; l <= last_layer; l++) {
+        qwen3_dev_layer_t *dl = &d->layers[l];
+
+        /* Self-attention (causal, padding keys masked) */
+        iris_dev_rms_norm(d->norm, d->x, dl->in_norm, seq_len, hidden, eps);
+        iris_dev_linear_bf16(d->qkv, d->norm, dl->w_qkv, seq_len, hidden, ldqkv);
+        iris_dev_head_norm_rope(d->qkv, ldqkv, dl->q_norm, d->rope_cos, d->rope_sin,
+                                seq_len, model->num_heads, hd, eps, 1);
+        iris_dev_head_norm_rope(d->qkv + q_dim, ldqkv, dl->k_norm, d->rope_cos, d->rope_sin,
+                                seq_len, model->num_kv_heads, hd, eps, 1);
+        iris_dev_attention(d->attn, q_dim, d->qkv, d->qkv + q_dim, d->qkv + q_dim + kv_dim,
+                           ldqkv, seq_len, seq_len, model->num_heads, model->num_kv_heads, hd,
+                           1.0f / sqrtf((float)hd), 1, attention_mask ? d->mask : NULL);
+        iris_dev_linear_f32(d->out, d->attn, dl->w_o, seq_len, q_dim, hidden);
+        iris_dev_residual(d->x, d->out, NULL, seq_len, hidden);
+
+        /* SwiGLU MLP */
+        iris_dev_rms_norm(d->norm, d->x, dl->post_norm, seq_len, hidden, eps);
+        iris_dev_linear_bf16(d->gate_up, d->norm, dl->w_gate_up, seq_len, hidden, 2 * inter);
+        iris_dev_swiglu(d->act, inter, d->gate_up, d->gate_up + inter, 2 * inter, seq_len, inter);
+        iris_dev_linear_f32(d->out, d->act, dl->w_down, seq_len, inter, hidden);
+        iris_dev_residual(d->x, d->out, NULL, seq_len, hidden);
+
+        for (int i = 0; i < num_out; i++)
+            if (l == out_layers[i])
+                iris_dev_download(model->layer_outputs[i], d->x,
+                                  (size_t)seq_len * hidden * sizeof(float));
+        if (iris_text_progress_callback)
+            iris_text_progress_callback(l, model->num_layers);
+    }
+    return 1;
+}
+#endif /* IRIS_DEV */
+
 
 /* Parse text_encoder/config.json to get architecture dimensions.
  * Sets model fields. Returns 0 on success, -1 on failure. */
@@ -1761,6 +1999,10 @@ void qwen3_model_free(qwen3_model_t *model) {
         free(model->layer_outputs[i]);
     }
 
+#ifdef IRIS_DEV
+    qwen3_dev_free(model);
+#endif
+
     /* Close mmap'd safetensors files if open */
     for (int i = 0; i < model->num_sf_files; i++) {
         if (model->sf_files[i]) safetensors_close(model->sf_files[i]);
@@ -1791,6 +2033,10 @@ qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap) {
     }
 
     /* Load model - use mmap mode if requested (saves ~14GB RAM) */
+#ifdef IRIS_DEV
+    /* The GPU path uploads the bf16 weights straight from the mapped files. */
+    if (iris_dev_available()) use_mmap = 1;
+#endif
     char model_path[512];
     snprintf(model_path, sizeof(model_path), "%s/text_encoder", model_dir);
     if (use_mmap) {

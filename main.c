@@ -36,6 +36,10 @@
 #include "iris_metal.h"
 #endif
 
+#ifdef IRIS_DEV
+#include "iris_dev.h"
+#endif
+
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -265,6 +269,9 @@ int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     iris_metal_init();
 #endif
+#ifdef IRIS_DEV
+    iris_dev_init();
+#endif
 
     /* Command line options */
     static struct option long_options[] = {
@@ -382,6 +389,12 @@ int main(int argc, char *argv[]) {
 
     /* Backend banner (suppressed by --quiet) */
     if (output_level != OUTPUT_QUIET) {
+#ifdef IRIS_DEV
+        if (iris_dev_available())
+            fprintf(stderr, "GPU: %s\n", iris_dev_name());
+        else
+            fprintf(stderr, "GPU: none found, running on the CPU\n");
+#endif
 #ifdef USE_METAL
         if (iris_metal_available()) {
             long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -718,6 +731,9 @@ int main(int argc, char *argv[]) {
 
 #ifdef USE_METAL
     iris_metal_cleanup();
+#endif
+#ifdef IRIS_DEV
+    iris_dev_cleanup();
 #endif
 
     return 0;

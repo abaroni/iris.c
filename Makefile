@@ -1,5 +1,5 @@
 # Iris - C Image Generation Engine
-# Supported models: FLUX.2 Klein (4B/9B), Z-Image-Turbo (6B)
+# Supported models: FLUX.2 Klein (4B/9B), Z-Image-Turbo (6B), FLUX.3 Image Klein
 # Makefile
 
 CC = gcc
@@ -22,7 +22,7 @@ LIB = libiris.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps
+.PHONY: all clean debug lib install info test pngtest help generic blas mps cuda rocm
 .NOTPARALLEL: mps
 
 # Default: show available targets
@@ -34,6 +34,8 @@ help:
 	@echo "Choose a backend:"
 	@echo "  make generic  - Pure C, no dependencies (slow)"
 	@echo "  make blas     - With BLAS acceleration (~30x faster)"
+	@echo "  make cuda     - NVIDIA GPU (CUDA toolkit)"
+	@echo "  make rocm     - AMD GPU (ROCm/HIP)"
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
@@ -71,6 +73,35 @@ endif
 blas: clean $(TARGET)
 	@echo ""
 	@echo "Built with BLAS backend (~30x faster than generic)"
+
+# =============================================================================
+# Backends: cuda (NVIDIA) and rocm (AMD). iris_cuda.cu builds with nvcc or,
+# as HIP, with hipcc. OPENBLAS=1 also uses OpenBLAS for CPU-side work.
+# GPU_ARCH overrides the target GPU (default: the GPU of this machine).
+# =============================================================================
+NVCC ?= nvcc
+HIPCC ?= hipcc
+CUDA_HOME ?= /usr/local/cuda
+ROCM_HOME ?= /opt/rocm
+DEV_CFLAGS = $(CFLAGS_BASE) -DIRIS_DEV $(if $(OPENBLAS),-DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas)
+DEV_BLAS_LIBS = $(if $(OPENBLAS),-lopenblas)
+
+cuda: clean
+	@$(MAKE) --no-print-directory $(TARGET) DEV_OBJS=iris_cuda.o CFLAGS="$(DEV_CFLAGS)" \
+		DEV_CC="$(NVCC) -O3 -arch=$(or $(GPU_ARCH),native) -x cu" \
+		DEV_LDFLAGS="-L$(CUDA_HOME)/lib64 -lcublas -lcudart -lstdc++ $(DEV_BLAS_LIBS)"
+	@echo ""
+	@echo "Built with CUDA backend"
+
+rocm: clean
+	@$(MAKE) --no-print-directory $(TARGET) DEV_OBJS=iris_cuda.o CFLAGS="$(DEV_CFLAGS)" \
+		DEV_CC="$(HIPCC) -O3 --offload-arch=$(or $(GPU_ARCH),native) -DIRIS_HIP -x hip" \
+		DEV_LDFLAGS="-L$(ROCM_HOME)/lib -lhipblas -lamdhip64 -lstdc++ $(DEV_BLAS_LIBS)"
+	@echo ""
+	@echo "Built with ROCm backend"
+
+iris_cuda.o: iris_cuda.cu iris_dev.h
+	$(DEV_CC) -c -o $@ $<
 
 # =============================================================================
 # Backend: mps (Apple Silicon Metal GPU)
@@ -112,8 +143,8 @@ endif
 # =============================================================================
 # Build rules
 # =============================================================================
-$(TARGET): $(OBJS) $(CLI_OBJS) main.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(TARGET): $(OBJS) $(CLI_OBJS) main.o $(DEV_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(DEV_LDFLAGS)
 
 lib: $(LIB)
 
@@ -155,7 +186,7 @@ install: $(TARGET) $(LIB)
 	install -m 644 iris_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o iris_cuda.o main.o $(TARGET) $(LIB)
 	rm -f iris_shaders_source.h
 
 info:
@@ -171,6 +202,8 @@ ifeq ($(UNAME_M),arm64)
 endif
 else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
+	@echo "  cuda    - NVIDIA GPU (requires the CUDA toolkit)"
+	@echo "  rocm    - AMD GPU (requires ROCm with hipBLAS)"
 endif
 
 # =============================================================================
@@ -182,7 +215,7 @@ iris_tokenizer.o: iris_tokenizer.c iris.h
 iris_vae.o: iris_vae.c iris.h iris_kernels.h
 iris_transformer_flux.o: iris_transformer_flux.c iris.h iris_kernels.h
 iris_transformer_zimage.o: iris_transformer_zimage.c iris.h iris_kernels.h iris_safetensors.h
-iris_transformer_flux3.o: iris_transformer_flux3.c iris.h iris_kernels.h iris_safetensors.h
+iris_transformer_flux3.o: iris_transformer_flux3.c iris.h iris_kernels.h iris_safetensors.h iris_dev.h
 iris_sample.o: iris_sample.c iris.h iris_kernels.h
 iris_image.o: iris_image.c iris.h
 iris_safetensors.o: iris_safetensors.c iris_safetensors.h
