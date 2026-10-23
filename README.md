@@ -11,15 +11,14 @@ Supported model families:
   - **4B base** (50 steps for max quality, or less. Classifier-Free Diffusion Guidance, much slower but more generation variety).
   - **9B distilled** (4 steps, larger model, higher quality. Non-commercial license).
   - **9B base** (50 steps, CFG, highest quality. Non-commercial license).
-  - Runs fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
 - **[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)** (by Tongyi-MAI):
   - **6B** (8 NFE / 9 scheduler steps, no CFG, fast).
-  - Runs fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
 - **[FLUX.3 Image Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein)** (by [Black Forest Labs](https://bfl.ai/)):
   - **5.6B distilled** (16 steps by default, trained for 4 to 16, no CFG. FLUX Kommunity License).
-  - **5.6B base** (50 steps, CFG. FLUX Kommunity License).
+  - **5.6B base** (50 steps, CFG. FLUX Kommunity License). Implemented but not tested yet: the weights were not accessible at the time of writing.
   - Text-to-image, editing (`-i image`) and multi-reference generation (`-i` repeated).
-  - Runs fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
+
+All the models run fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
 
 ## Quick Start
 
@@ -71,7 +70,7 @@ For FLUX.3 Image Klein (gated, accept the license on HuggingFace first, ~20GB):
 ./iris -d flux-3-klein -p "a fish" -o fish.png
 ```
 
-That's it. No Python runtime or CUDA toolkit required at inference time.
+That's it. No Python runtime required at inference time.
 
 ## Example Output
 
@@ -88,12 +87,12 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 ## Features
 
 - **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
-- **Metal GPU acceleration**: Automatic on Apple Silicon Macs. Performance matches PyTorch's optimized MPS pipeline
+- **GPU acceleration**: Metal on Apple Silicon Macs (automatic), CUDA on NVIDIA and ROCm on AMD GPUs. On Apple Silicon it is faster than PyTorch's optimized MPS pipeline
 - **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run at all
 - **Text-to-image**: Generate images from text prompts
 - **Image-to-image**: Transform existing images guided by prompts (Flux models)
 - **Multi-reference**: Combine multiple reference images (e.g., `-i car.png -i beach.png` for "car on beach")
-- **Integrated text encoder**: Qwen3 encoder built-in (4B or 8B depending on model), no external embedding computation needed
+- **Integrated text encoder**: Qwen3 encoder built-in (4B or 8B depending on model, Qwen3-VL 4B for FLUX.3), no external embedding computation needed
 - **Memory efficient**: Automatic encoder release after encoding (up to ~16GB freed)
 - **Memory-mapped weights**: Enabled by default. Reduces peak memory from ~16GB to ~4-5GB. Fastest mode on MPS; BLAS users with plenty of RAM may prefer `--no-mmap` for faster inference
 - **Size-independent seeds**: Same seed produces similar compositions at different resolutions. Explore at 256x256, then render at 512x512 with the same seed
@@ -419,7 +418,7 @@ The MPS implementation is faster than the PyTorch optimized pipeline at all reso
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 - The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14.23 seconds (in the same hardware), however it is worth noting that it uses 6-bit quantized weights, while this implementation uses the official BF16 weights. The 6-bit quantization used by Draw Things provides both a big memory win and a moderate speed advantage (not nearly as much as it could in an LLM, where causal attention is dominated by memory bandwidth); if we account for this, the performance is comparable.
 
-### FLUX.3 on the GPU
+### Timings on recent GPUs
 
 FLUX.3 Image Klein distilled, default 16 steps, wall clock including model
 loading:
@@ -649,7 +648,7 @@ This reduces peak memory from ~16GB to ~4-5GB, making inference possible on 16GB
 
 **Performance varies by backend:**
 
-- **MPS (Apple Silicon):** mmap is the **fastest** mode. The model stores weights in bf16 format, and MPS uses them directly via zero-copy pointers into the memory-mapped region. No conversion overhead, and the kernel handles paging efficiently.
+- **MPS, CUDA, ROCm:** mmap is the **fastest** mode. The weights are stored in bf16 format and go from the memory-mapped files to GPU memory without conversion; the transformer weights are uploaded once, at load time.
 
 - **BLAS (CPU):** mmap is **slightly slower** but uses much less RAM. BLAS requires f32 weights, so each block must be converted from bf16->f32 on every step (25 blocks x 4 steps = 100 conversions). With `--no-mmap`, this conversion happens once at startup. **Recommendation:** If you have 32GB+ RAM and use BLAS, try `--no-mmap` for faster inference. If RAM is limited, mmap lets you run at all.
 
