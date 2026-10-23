@@ -436,6 +436,9 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
 1. **Tokenizer merges format**: the Qwen3-VL tokenizer.json stores merges as
    `"a b"` strings, not `["a", "b"]` pairs; unparsed merges silently give
    character-level tokens.
+   The pre-tokenizer must follow the Qwen2 split regex exactly (all models):
+   a simplified split gave different tokens for hyphenated words, quotes,
+   punctuation before newlines, repeated spaces, and changed the images.
 2. **GPU attention threadgroup size**: the causal attention kernels use tree
    reductions that need a power-of-two thread count. Flux/Z-Image always used
    512 tokens; Flux3 windows (80, 160, ...) exposed the bug.

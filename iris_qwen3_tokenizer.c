@@ -805,100 +805,126 @@ static char *text_to_bytes(const char *text) {
 }
 
 /* ========================================================================
- * Pre-tokenization (GPT-style regex split)
+ * Pre-tokenization (Qwen2 regex split)
  * ======================================================================== */
 
-/*
- * Simplified pre-tokenizer that handles the main cases:
- * - Contractions: 's, 't, 're, 've, 'm, 'll, 'd
- * - Words with optional leading space
- * - Numbers
- * - Punctuation/symbols
- * - Whitespace
- */
+/* Decode the UTF-8 character at s, storing its length (1 for invalid bytes). */
+static uint32_t utf8_decode(const char *s, int *len) {
+    const unsigned char *u = (const unsigned char *)s;
+    int n = u[0] < 0x80 ? 1 : (u[0] & 0xE0) == 0xC0 ? 2 : (u[0] & 0xF0) == 0xE0 ? 3 :
+            (u[0] & 0xF8) == 0xF0 ? 4 : 1;
+    uint32_t c = n == 1 ? u[0] : u[0] & (0x7F >> n);
+    for (int i = 1; i < n; i++) {
+        if ((u[i] & 0xC0) != 0x80) { *len = 1; return u[0]; }
+        c = (c << 6) | (u[i] & 0x3F);
+    }
+    *len = n;
+    return c;
+}
+
+/* \p{N}: exact for ASCII and Latin-1 (superscripts, fractions). */
+static int cp_is_number(uint32_t c) {
+    return (c >= '0' && c <= '9') || c == 0xB2 || c == 0xB3 || c == 0xB9 ||
+           (c >= 0xBC && c <= 0xBE) || (c >= 0xFF10 && c <= 0xFF19);
+}
+
+/* \p{L}: exact for ASCII and Latin-1. Above, the punctuation and symbol
+ * blocks found in prompts (dashes, quotes, ellipsis, arrows, math, CJK
+ * and fullwidth punctuation, emoji) are not letters, the rest is. */
+static int cp_is_letter(uint32_t c) {
+    if (c < 0x80) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    if (c < 0x100) return c == 0xAA || c == 0xB5 || c == 0xBA ||
+                          (c >= 0xC0 && c != 0xD7 && c != 0xF7);
+    if (c >= 0xFF00 && c <= 0xFF65)
+        return (c >= 0xFF21 && c <= 0xFF3A) || (c >= 0xFF41 && c <= 0xFF5A);
+    return !((c >= 0x2000 && c <= 0x2BFF) || (c >= 0x3000 && c <= 0x303F) ||
+             (c >= 0xFE30 && c <= 0xFE6F) || (c >= 0x1F000 && c <= 0x1FAFF));
+}
+
+/* \s */
+static int cp_is_space(uint32_t c) {
+    return c == ' ' || (c >= 0x09 && c <= 0x0D) || c == 0x85 || c == 0xA0 ||
+           c == 0x1680 || (c >= 0x2000 && c <= 0x200A) || c == 0x2028 ||
+           c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+static int cp_is_newline(uint32_t c) { return c == '\r' || c == '\n'; }
+
+/* Length of the match at s of the Qwen2 pre-tokenizer pattern
+ *   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|
+ *    ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+ * trying the alternatives in order, as the regex engine does. */
+static int pretoken_len(const char *s) {
+    int n, n2;
+    uint32_t c = utf8_decode(s, &n);
+
+    /* Contractions */
+    if (c == '\'') {
+        char a = tolower((unsigned char)s[1]), b = a ? tolower((unsigned char)s[2]) : 0;
+        if ((a == 'r' || a == 'v') && b == 'e') return 3;
+        if (a == 'l' && b == 'l') return 3;
+        if (a == 's' || a == 't' || a == 'm' || a == 'd') return 2;
+    }
+
+    /* Letters, with an optional leading character that is not a letter,
+     * a number or a newline */
+    int p = 0;
+    if (!cp_is_letter(c) && !cp_is_number(c) && !cp_is_newline(c) &&
+        cp_is_letter(utf8_decode(s + n, &n2)))
+        p = n;
+    if (p || cp_is_letter(c)) {
+        while (s[p] && cp_is_letter(utf8_decode(s + p, &n2))) p += n2;
+        return p;
+    }
+
+    /* One number */
+    if (cp_is_number(c)) return n;
+
+    /* Punctuation run, with an optional leading space and trailing newlines */
+    p = c == ' ' ? 1 : 0;
+    int q = p;
+    while (s[q]) {
+        uint32_t d = utf8_decode(s + q, &n2);
+        if (cp_is_space(d) || cp_is_letter(d) || cp_is_number(d)) break;
+        q += n2;
+    }
+    if (q > p) {
+        while (s[q] == '\r' || s[q] == '\n') q++;
+        return q;
+    }
+
+    /* Whitespace: up to its last newline, or all but the last character
+     * when followed by a non-space, or all of it */
+    int end = 0, last_nl = -1, last_start = 0;
+    while (s[end]) {
+        uint32_t d = utf8_decode(s + end, &n2);
+        if (!cp_is_space(d)) break;
+        if (cp_is_newline(d)) last_nl = end + n2;
+        last_start = end;
+        end += n2;
+    }
+    if (end == 0) return n;   /* not reached: every character matches above */
+    if (last_nl > 0) return last_nl;
+    if (!s[end] || last_start == 0) return end;
+    return last_start;
+}
+
 static char **pretokenize(const char *text, int *num_chunks) {
     int capacity = 64;
     char **chunks = malloc(capacity * sizeof(char *));
     int count = 0;
 
-    const char *p = text;
-    while (*p) {
-        const char *start = p;
-
-        /* Check for contractions */
-        if (*p == '\'' && p[1]) {
-            char lower = tolower(p[1]);
-            if (lower == 's' || lower == 't' || lower == 'm' || lower == 'd') {
-                p += 2;
-            } else if ((lower == 'r' || lower == 'v' || lower == 'l') && p[2] &&
-                       (tolower(p[2]) == 'e' || tolower(p[2]) == 'l')) {
-                p += 3;
-            } else {
-                p++;
-            }
+    for (const char *p = text; *p; ) {
+        int len = pretoken_len(p);
+        char *chunk = malloc(len + 1);
+        memcpy(chunk, p, len);
+        chunk[len] = '\0';
+        if (count >= capacity) {
+            capacity *= 2;
+            chunks = realloc(chunks, capacity * sizeof(char *));
         }
-        /* Letters (possibly with leading space) */
-        else if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                 (unsigned char)*p >= 128) {
-            while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                          (unsigned char)*p >= 128)) {
-                if ((unsigned char)*p >= 128) {
-                    /* Skip UTF-8 continuation bytes */
-                    if (((unsigned char)*p & 0xE0) == 0xC0) p += 2;
-                    else if (((unsigned char)*p & 0xF0) == 0xE0) p += 3;
-                    else if (((unsigned char)*p & 0xF8) == 0xF0) p += 4;
-                    else p++;
-                } else {
-                    p++;
-                }
-            }
-        }
-        /* Numbers */
-        else if (*p >= '0' && *p <= '9') {
-            while (*p >= '0' && *p <= '9') p++;
-        }
-        /* Space followed by word - keep space with word */
-        else if (*p == ' ' && p[1] && (isalpha(p[1]) || (unsigned char)p[1] >= 128)) {
-            p++;  /* Include the space */
-            while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                          (unsigned char)*p >= 128)) {
-                if ((unsigned char)*p >= 128) {
-                    if (((unsigned char)*p & 0xE0) == 0xC0) p += 2;
-                    else if (((unsigned char)*p & 0xF0) == 0xE0) p += 3;
-                    else if (((unsigned char)*p & 0xF8) == 0xF0) p += 4;
-                    else p++;
-                } else {
-                    p++;
-                }
-            }
-        }
-        /* Space followed by number */
-        else if (*p == ' ' && p[1] >= '0' && p[1] <= '9') {
-            p++;
-            while (*p >= '0' && *p <= '9') p++;
-        }
-        /* Whitespace */
-        else if (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') {
-            while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
-        }
-        /* Single character/punctuation */
-        else {
-            p++;
-        }
-
-        /* Add chunk */
-        if (p > start) {
-            int len = p - start;
-            char *chunk = malloc(len + 1);
-            memcpy(chunk, start, len);
-            chunk[len] = '\0';
-
-            if (count >= capacity) {
-                capacity *= 2;
-                chunks = realloc(chunks, capacity * sizeof(char *));
-            }
-            chunks[count++] = chunk;
-        }
+        chunks[count++] = chunk;
+        p += len;
     }
 
     *num_chunks = count;
